@@ -1,6 +1,7 @@
-portainer_url: "https://10.20.0.12:9443"
+# ---- Portainer ----
+portainer_url: "https://10.20.0.12:9443"    # CE 2.33.2 LTS (UI en 9443)
 
-# Mapa de endpoints (IDs reales de tus agentes/servidores en Portainer)
+# Mapa de endpoints: {nombre_logico: endpointId}
 endpoints:
   mon: 2
   airflow: 2
@@ -8,4 +9,40 @@ endpoints:
   spark: 2
   db: 2
 
+# Git privado (PAT) – en vault, no plano
 git_default_ref: "main"
+github_username: "{{ vault_github_username }}"
+github_pat: "{{ vault_github_pat }}"
+
+# Stacks deseados (ajusta compose_path si cambian)
+stacks:
+  - name: "mon"
+    endpoint: "mon"
+    repo_url: "https://github.com/infra-trade/infra.git"
+    compose_path: "mon/compose/docker-compose.yml"
+    git_ref: "{{ git_default_ref }}"
+    env: []
+  - name: "airflow"
+    endpoint: "airflow"
+    repo_url: "https://github.com/infra-trade/infra.git"
+    compose_path: "airflow/compose/docker-compose.yml"
+    git_ref: "{{ git_default_ref }}"
+    env: []
+  - name: "kafka"
+    endpoint: "kafka"
+    repo_url: "https://github.com/infra-trade/infra.git"
+    compose_path: "kafka/compose/docker-compose.yml"
+    git_ref: "{{ git_default_ref }}"
+    env: []
+  - name: "spark"
+    endpoint: "spark"
+    repo_url: "https://github.com/infra-trade/infra.git"
+    compose_path: "spark/compose/docker-compose.yml"
+    git_ref: "{{ git_default_ref }}"
+    env: []
+  - name: "db"
+    endpoint: "db"
+    repo_url: "https://github.com/infra-trade/infra.git"
+    compose_path: "db/compose/docker-compose.yml"
+    git_ref: "{{ git_default_ref }}"
+    env: []
