@@ -25,7 +25,8 @@
     status_code: 200
   register: _stacks_list
 
-- name: Calcular match del stack objetivo
+# === CAMBIO 1: primero calculamos la lista de matches ===
+- name: Calcular lista de coincidencias
   ansible.builtin.set_fact:
     _matches: >-
       {{
@@ -34,8 +35,12 @@
           | selectattr('EndpointId','equalto', _endpoint_id)
           | list)
       }}
+
+# === CAMBIO 2: después derivamos flags y objeto existente ===
+- name: Derivar flags de existencia y stack existente
+  ansible.builtin.set_fact:
     _stack_exists: "{{ (_matches | length) > 0 }}"
-    _existing_stack: "{{ _matches[0] if (_matches | length) > 0 else {} }}"
+    _existing_stack: "{{ (_matches | first) if (_matches | length) > 0 else {} }}"
 
 - name: Debug match
   ansible.builtin.debug:
