@@ -1,48 +1,49 @@
 ---
-- name: Create/Update Portainer stacks from Git (no loop on block)
-  hosts: monitor
-  gather_facts: false
+# Crea/actualiza stacks de Portainer desde un repositorio Git PRIVADO (CE 2.33.2 LTS)
+# Requiere:
+# - group_vars/all.yml:    portainer_url, endpoints (mapa), git_default_ref (opcional)
+# - group_vars/all.vault.yml (Vault): github_username, github_pat
+# - Exportar PORTAINER_TOKEN en el entorno o definir portainer_token en vars
+
+- name: Create/Update Portainer stacks from Git (CE 2.33.2)
+  hosts: mon-core
   become: false
+  gather_facts: false
 
   vars:
-    portainer_url: "https://{{ hostvars[inventory_hostname].ansible_host | default(inventory_hostname) }}:9443"
-    validate_certs: false
-
-    endpoints:
-      mon: 2
-      airflow: 3
-      kafka: 4
-      spark: 5
-      db: 6
-
+    # Define aquí tus stacks. Ajusta compose_path y endpoint según tu árbol de repo.
     stacks:
-      - name: mon
-        endpoint: mon
-        repo_url: "git@github.com:infra-trade/infra.git"
+      - name: "mon"
+        endpoint: "mon"
+        repo_url: "https://github.com/infra-trade/infra.git"
         compose_path: "mon/compose/docker-compose.yml"
         git_ref: "main"
         env: []
-      - name: airflow
-        endpoint: airflow
-        repo_url: "git@github.com:infra-trade/infra.git"
+
+      - name: "airflow"
+        endpoint: "airflow"
+        repo_url: "https://github.com/infra-trade/infra.git"
         compose_path: "airflow/compose/docker-compose.yml"
         git_ref: "main"
         env: []
-      - name: kafka
-        endpoint: kafka
-        repo_url: "git@github.com:infra-trade/infra.git"
+
+      - name: "kafka"
+        endpoint: "kafka"
+        repo_url: "https://github.com/infra-trade/infra.git"
         compose_path: "kafka/compose/docker-compose.yml"
         git_ref: "main"
         env: []
-      - name: spark
-        endpoint: spark
-        repo_url: "git@github.com:infra-trade/infra.git"
+
+      - name: "spark"
+        endpoint: "spark"
+        repo_url: "https://github.com/infra-trade/infra.git"
         compose_path: "spark/compose/docker-compose.yml"
         git_ref: "main"
         env: []
-      - name: db
-        endpoint: db
-        repo_url: "git@github.com:infra-trade/infra.git"
+
+      - name: "db"
+        endpoint: "db"
+        repo_url: "https://github.com/infra-trade/infra.git"
         compose_path: "db/compose/docker-compose.yml"
         git_ref: "main"
         env: []
@@ -51,32 +52,28 @@
     - name: Resolver token (env primero, si no existe usa var portainer_token)
       ansible.builtin.set_fact:
         portainer_api_token: >-
-          {{
-            (lookup('env','PORTAINER_TOKEN'))
-            if (lookup('env','PORTAINER_TOKEN') | length) > 0
-            else (portainer_token | default(''))
-          }}
+          {{ lookup('env','PORTAINER_TOKEN') |
+             default(portainer_token | default('', true), true) }}
 
     - name: Fallar si no hay token
       ansible.builtin.fail:
-        msg: "Define PORTAINER_TOKEN (export) o variable 'portainer_token' en group_vars."
+        msg: "Falta PORTAINER_TOKEN (o var portainer_token). Expórtalo/defínelo antes de continuar."
       when: portainer_api_token | length == 0
 
     - name: Verificar conectividad con Portainer
       ansible.builtin.uri:
         url: "{{ portainer_url }}/api/system/status"
         method: GET
-        validate_certs: "{{ validate_certs }}"
-        return_content: false
+        headers:
+          Authorization: "Bearer {{ portainer_api_token }}"
+        validate_certs: false
+        return_content: true
         status_code: 200
+      register: _system_status
 
   tasks:
     - name: Crear/actualizar cada stack
-      include_tasks: "tasks/portainer_stack.yml"
+      ansible.builtin.include_tasks: "tasks/portainer_stack.yml"
       loop: "{{ stacks }}"
       loop_control:
-        loop_var: item_stack
-        label: "{{ item_stack.name }}"
-      vars:
-        st: "{{ item_stack }}"
-        endp_map: "{{ endpoints }}"   # 👈 único var pasado
+        loop_var: st
