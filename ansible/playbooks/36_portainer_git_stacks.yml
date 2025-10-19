@@ -1,156 +1,82 @@
 ---
-- name: Ensure Portainer stacks from Git (create or update)
-  hosts: localhost
+- name: Create/Update Portainer stacks from Git (no loop on block)
+  hosts: monitor
   gather_facts: false
+  become: false
 
   vars:
-    # === Portainer (ajusta host/puerto si aplica) ===
-    portainer_base: "https://mon-core:9443/api"
+    portainer_url: "https://{{ hostvars[inventory_hostname].ansible_host | default(inventory_hostname) }}:9443"
+    validate_certs: false
 
-    # Toma la API key desde variable de entorno o pónla en Vault y reemplace aquí.
-    portainer_api_key: "{{ lookup('env', 'PORTAINER_API_KEY') | default('', true) }}"
+    endpoints:
+      mon: 2
+      airflow: 3
+      kafka: 4
+      spark: 5
+      db: 6
 
-    # === Definición de stacks a gestionar ===
-    # endpoint: debe coincidir con el "Name" del Endpoint en Portainer (normalmente el hostname del agente)
-    # compose_path: ruta dentro del repo al docker-compose.yml
-    # git_ref: usa refs/heads/main (rama) o refs/tags/vX.Y (tag)
-    stacks_wanted:
+    stacks:
       - name: mon
-        endpoint: "mon-core"
-        repo_url: "https://github.com/infra-trade/infra.git"        # TODO
-        compose_path: "mon/compose/docker-compose.yml"         # TODO
-        git_ref: "refs/heads/main"                             # TODO
-        env: { }
-
+        endpoint: mon
+        repo_url: "git@github.com:infra-trade/infra.git"
+        compose_path: "mon/compose/docker-compose.yml"
+        git_ref: "main"
+        env: []
       - name: airflow
-        endpoint: "airflow-core"
-        repo_url: "https://github.com/infra-trade/infra.git"        # TODO
-        compose_path: "airflow/compose/docker-compose.yml"     # TODO
-        git_ref: "refs/heads/main"                             # TODO
-        env:
-          AIRFLOW_UID: "50000"
-
+        endpoint: airflow
+        repo_url: "git@github.com:infra-trade/infra.git"
+        compose_path: "airflow/compose/docker-compose.yml"
+        git_ref: "main"
+        env: []
       - name: kafka
-        endpoint: "kafka-core"
-        repo_url: "https://github.com/infra-trade/infra.git"        # TODO
-        compose_path: "kafka/compose/docker-compose.yml"       # TODO
-        git_ref: "refs/heads/main"                             # TODO
-        env: { }
-
+        endpoint: kafka
+        repo_url: "git@github.com:infra-trade/infra.git"
+        compose_path: "kafka/compose/docker-compose.yml"
+        git_ref: "main"
+        env: []
       - name: spark
-        endpoint: "spark-core"
-        repo_url: "https://github.com/infra-trade/infra.git"        # TODO
-        compose_path: "spark/compose/docker-compose.yml"       # TODO
-        git_ref: "refs/heads/main"                             # TODO
-        env: { }
-
+        endpoint: spark
+        repo_url: "git@github.com:infra-trade/infra.git"
+        compose_path: "spark/compose/docker-compose.yml"
+        git_ref: "main"
+        env: []
       - name: db
-        endpoint: "db-core"
-        repo_url: "https://github.com/infra-trade/infra.git"        # TODO
-        compose_path: "db/compose/docker-compose.yml"          # TODO
-        git_ref: "refs/heads/main"                             # TODO
-        env: { }
+        endpoint: db
+        repo_url: "git@github.com:infra-trade/infra.git"
+        compose_path: "db/compose/docker-compose.yml"
+        git_ref: "main"
+        env: []
+
+  pre_tasks:
+    - name: Resolver token (env primero, si no existe usa var portainer_token)
+      ansible.builtin.set_fact:
+        portainer_api_token: >-
+          {{
+            (lookup('env','PORTAINER_TOKEN'))
+            if (lookup('env','PORTAINER_TOKEN') | length) > 0
+            else (portainer_token | default(''))
+          }}
+
+    - name: Fallar si no hay token
+      ansible.builtin.fail:
+        msg: "Define PORTAINER_TOKEN (export) o variable 'portainer_token' en group_vars."
+      when: portainer_api_token | length == 0
+
+    - name: Verificar conectividad con Portainer
+      ansible.builtin.uri:
+        url: "{{ portainer_url }}/api/system/status"
+        method: GET
+        validate_certs: "{{ validate_certs }}"
+        return_content: false
+        status_code: 200
 
   tasks:
-    - name: Fail if API key missing
-      assert:
-        that:
-          - portainer_api_key is string
-          - portainer_api_key | length > 0
-        fail_msg: "Falta PORTAINER_API_KEY. Exporta: export PORTAINER_API_KEY='ptr_XXXX'"
-
-    - name: Get endpoints (agent list)
-      uri:
-        url: "{{ portainer_base }}/endpoints"
-        method: GET
-        headers:
-          X-API-Key: "{{ portainer_api_key }}"
-        validate_certs: false
-        return_content: true
-      register: endpoints_resp
-
-    - name: Build endpoints map Name -> Id
-      set_fact:
-        endpoints_map: >-
-          {{
-            dict( (endpoints_resp.json | default([]))
-                | map(attribute='Name') 
-                | zip((endpoints_resp.json | default([])) | map(attribute='Id')) )
-          }}
-
-    - name: Get existing stacks
-      uri:
-        url: "{{ portainer_base }}/stacks"
-        method: GET
-        headers:
-          X-API-Key: "{{ portainer_api_key }}"
-        validate_certs: false
-        return_content: true
-      register: stacks_resp
-
-    - name: Build existing stack map Name -> Id
-      set_fact:
-        stacks_map: >-
-          {{
-            dict( (stacks_resp.json | default([]))
-                | map(attribute='Name')
-                | zip((stacks_resp.json | default([])) | map(attribute='Id')) )
-          }}
-
-    - name: Create or update each desired stack (loop por item)
-      vars:
-        this_exists: "{{ item.name in stacks_map }}"
-        endpoint_id: "{{ endpoints_map[item.endpoint] | default(omit) }}"
-        env_list: "{{ (item.env | default({})) | dict2items(key_name='name', value_name='value') }}"
-      block:
-        - name: Guard - endpoint must exist
-          assert:
-            that: endpoint_id is defined
-            fail_msg: "Endpoint '{{ item.endpoint }}' no existe en Portainer. Revisa el nombre."
-
-        - name: If exists -> GIT PULL
-          uri:
-            url: "{{ portainer_base }}/stacks/{{ stacks_map[item.name] }}/git/pull?endpointId={{ endpoint_id }}"
-            method: POST
-            headers:
-              X-API-Key: "{{ portainer_api_key }}"
-            body_format: json
-            body:
-              prune: true
-              pullImage: true
-            status_code: [200]
-            validate_certs: false
-          when: this_exists
-
-        - name: If not exists -> CREATE from repo
-          uri:
-            url: "{{ portainer_base }}/stacks/create?type=2&method=repository&endpointId={{ endpoint_id }}"
-            method: POST
-            headers:
-              X-API-Key: "{{ portainer_api_key }}"
-            body_format: json
-            body:
-              name: "{{ item.name }}"
-              composeFilePathInRepo: "{{ item.compose_path }}"
-              env: "{{ env_list }}"
-              prune: true
-              repository:
-                url: "{{ item.repo_url }}"
-                referenceName: "{{ item.git_ref }}"
-                authentication: false
-              # autoUpdate opcional
-              # autoUpdate:
-              #   interval: "5m"
-            status_code: [200]
-            validate_certs: false
-          when: not this_exists
-      loop: "{{ stacks_wanted }}"
+    - name: Crear/actualizar cada stack
+      include_tasks: "tasks/portainer_stack.yml"
+      loop: "{{ stacks }}"
       loop_control:
-        label: "{{ item.name }} @ {{ item.endpoint }}"
-
-    - name: Summary
-      debug:
-        msg:
-          - "Endpoints conocidos: {{ endpoints_map }}"
-          - "Stacks existentes: {{ stacks_map | list }}"
-          - "Stacks deseadas: {{ stacks_wanted | map(attribute='name') | list }}"
+        loop_var: item_stack
+        label: "{{ item_stack.name }}"
+      vars:
+        st: "{{ item_stack }}"
+        endp_map: "{{ endpoints }}"   # 👈 único var pasado

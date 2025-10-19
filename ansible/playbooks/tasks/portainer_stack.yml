@@ -1,10 +1,10 @@
+# playbooks/tasks/portainer_stack.yml
 ---
-# Requiere variables del item: st.name, st.endpoint, st.repo_url, st.compose_path, st.git_ref, st.env
-# Requiere vars del play: portainer_url, portainer_api_token, endpoints (mapa)
+# Requiere: st.*, portainer_url, portainer_api_token, validate_certs, endp_map
 
 - name: Resolver endpointId para {{ st.name }}
   ansible.builtin.set_fact:
-    _endpoint_id: "{{ endpoints[st.endpoint] | default(omit) }}"
+    _endpoint_id: "{{ endp_map[st.endpoint] | default(omit) }}"
 
 - name: Validar endpointId mapeado
   ansible.builtin.assert:
@@ -19,25 +19,28 @@
     url: "{{ portainer_url }}/api/stacks"
     method: GET
     headers:
-      Authorization: "Bearer {{ portainer_api_token }}"
-    validate_certs: false
+      X-API-Key: "{{ portainer_api_token }}"
+    validate_certs: "{{ validate_certs }}"
     return_content: true
     status_code: 200
   register: _stacks_list
 
-- name: Buscar stack objetivo en respuesta
+- name: Calcular match del stack objetivo
   ansible.builtin.set_fact:
-    _existing_stack: >-
+    _matches: >-
       {{
-        (_stacks_list.json | selectattr('Name','equalto', st.name)
-                           | selectattr('EndpointId','equalto', _endpoint_id)
-                           | list | first) | default(None)
+        (_stacks_list.json
+          | selectattr('Name','equalto', st.name)
+          | selectattr('EndpointId','equalto', _endpoint_id)
+          | list)
       }}
+    _stack_exists: "{{ (_matches | length) > 0 }}"
+    _existing_stack: "{{ _matches[0] if (_matches | length) > 0 else {} }}"
 
 - name: Debug match
   ansible.builtin.debug:
     msg:
-      - "Stack '{{ st.name }}' en endpoint {{ _endpoint_id }} => {{ 'EXISTE' if _existing_stack else 'NO EXISTE' }}"
+      - "Stack '{{ st.name }}' en endpoint {{ _endpoint_id }} => {{ 'EXISTE' if _stack_exists else 'NO EXISTE' }}"
 
 # 2) Crear si no existe: type=2 (compose), method=repository (desde Git)
 - name: Crear stack (si NO existe)
@@ -45,9 +48,9 @@
     url: "{{ portainer_url }}/api/stacks?type=2&method=repository&endpointId={{ _endpoint_id }}"
     method: POST
     headers:
-      Authorization: "Bearer {{ portainer_api_token }}"
+      X-API-Key: "{{ portainer_api_token }}"
       Content-Type: "application/json"
-    validate_certs: false
+    validate_certs: "{{ validate_certs }}"
     body_format: json
     body:
       Name: "{{ st.name }}"
@@ -58,7 +61,7 @@
       Env: "{{ st.env | default([]) }}"
     status_code: [200, 201]
   register: _create_resp
-  when: _existing_stack is not defined or _existing_stack == None
+  when: not _stack_exists
   changed_when: true
 
 # 3) Actualizar si existe: PUT /api/stacks/{id}?endpointId=...
@@ -67,9 +70,9 @@
     url: "{{ portainer_url }}/api/stacks/{{ _existing_stack.Id }}?endpointId={{ _endpoint_id }}"
     method: PUT
     headers:
-      Authorization: "Bearer {{ portainer_api_token }}"
+      X-API-Key: "{{ portainer_api_token }}"
       Content-Type: "application/json"
-    validate_certs: false
+    validate_certs: "{{ validate_certs }}"
     body_format: json
     body:
       Prune: true
@@ -79,5 +82,5 @@
       Env: "{{ st.env | default([]) }}"
     status_code: 200
   register: _update_resp
-  when: _existing_stack is defined and _existing_stack != None
+  when: _stack_exists
   changed_when: true
