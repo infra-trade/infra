@@ -1,84 +1,79 @@
 ---
-- name: Manage Portainer Git Stacks (create/update from mono-repo)
-  hosts: localhost
+- name: Create/Update Portainer stacks from Git (no loop on block)
+  hosts: monitor
   gather_facts: false
+  become: false
 
   vars:
-    portainer_url: "https://mon-core:9443"
-    portainer_token: "{{ lookup('env','PORTAINER_TOKEN') | default('', true) }}"
-    repo_url: "git@github.com:infra-trade/infra.git"
-    git_ref: "main"
+    # URL del Portainer Server en mon-core
+    portainer_url: "https://{{ hostvars[inventory_hostname].ansible_host | default(inventory_hostname) }}:9443"
+    validate_certs: false
 
-    # Pon aquí los IDs reales de cada endpoint (agente)
-    endpoints:
-      - { name: "airflow-core", id: 2, compose_path: "airflow/compose/docker-compose.yml", stack_name: "airflow-core" }
-      - { name: "kafka-core",   id: 3, compose_path: "kafka/compose/docker-compose.yml",   stack_name: "kafka-core" }
-      - { name: "spark-core",   id: 4, compose_path: "spark/compose/docker-compose.yml",   stack_name: "spark-core" }
-      - { name: "db-core",      id: 5, compose_path: "db/compose/docker-compose.yml",      stack_name: "db-core" }
-      - { name: "mon-core",     id: 1, compose_path: "mon/compose/docker-compose.yml",     stack_name: "mon-core" }
+    # Token: toma del entorno PORTAINER_TOKEN o de var 'portainer_api_token' si existe
+    portainer_api_token: "{{ lookup('env','PORTAINER_TOKEN') | default(portainer_api_token | default('', true), true) }}"
+
+    # Stacks a gestionar (ajusta endpoint_id según tus Endpoints reales)
+    stacks:
+      - name: mon
+        endpoint_id: 2
+        repo_url: "git@github.com:infra-trade/infra.git"
+        compose_path: "mon/compose/docker-compose.yml"
+        git_ref: "main"
+        env: []
+
+      - name: airflow
+        endpoint_id: 3
+        repo_url: "git@github.com:infra-trade/infra.git"
+        compose_path: "airflow/compose/docker-compose.yml"
+        git_ref: "main"
+        env: []
+
+      - name: kafka
+        endpoint_id: 4
+        repo_url: "git@github.com:infra-trade/infra.git"
+        compose_path: "kafka/compose/docker-compose.yml"
+        git_ref: "main"
+        env: []
+
+      - name: spark
+        endpoint_id: 5
+        repo_url: "git@github.com:infra-trade/infra.git"
+        compose_path: "spark/compose/docker-compose.yml"
+        git_ref: "main"
+        env: []
+
+      - name: db
+        endpoint_id: 6
+        repo_url: "git@github.com:infra-trade/infra.git"
+        compose_path: "db/compose/docker-compose.yml"
+        git_ref: "main"
+        env: []
+
+  pre_tasks:
+    - name: Fail if token is missing
+      fail:
+        msg: "Define PORTAINER_TOKEN en el entorno del controlador o variable 'portainer_api_token'."
+      when: (portainer_api_token | length) == 0
+
+    - name: Check Portainer is reachable
+      uri:
+        url: "{{ portainer_url }}/api/system/status"
+        method: GET
+        return_content: false
+        validate_certs: "{{ validate_certs }}"
+        status_code: 200
+      register: _portainer_status
 
   tasks:
-    - name: Fail if PORTAINER_TOKEN missing
-      fail:
-        msg: "Define PORTAINER_TOKEN env var con tu Access Token de Portainer (My account → Add access token)."
-      when: portainer_token | length == 0
-
-    - name: Ensure stacks from Git (create or update)
-      vars:
-        headers:
-          Authorization: "Bearer {{ portainer_token }}"
-          Accept: "application/json"
-          Content-Type: "application/json"
-        payload: |
-          {
-            "name": "{{ item.stack_name }}",
-            "repositoryURL": "{{ repo_url }}",
-            "repositoryReferenceName": "{{ git_ref }}",
-            "composeFilePathInRepository": "{{ item.compose_path }}",
-            "autoUpdate": {
-              "interval": "5m",
-              "webhook": false
-            }
-          }
-      block:
-        - name: Try create (POST /stacks/create?type=2&method=repository&endpointId=ID)
-          uri:
-            url: "{{ portainer_url }}/api/stacks/create?type=2&method=repository&endpointId={{ item.id }}"
-            method: POST
-            headers: "{{ headers }}"
-            body: "{{ payload }}"
-            body_format: json
-            validate_certs: false
-            status_code: [200, 201]
-          register: create_res
-          failed_when: false
-
-        - name: If exists, update (PUT /stacks/{id}) — first, find stack by name
-          uri:
-            url: "{{ portainer_url }}/api/stacks"
-            method: GET
-            headers: "{{ headers }}"
-            validate_certs: false
-          register: stacks_list
-          when: create_res.status not in [200,201]
-
-        - name: Compute stack_id by name
-          set_fact:
-            the_stack_id: "{{ (stacks_list.json | selectattr('Name','equalto', item.stack_name) | list | first).Id | default(0) }}"
-          when: create_res.status not in [200,201]
-
-        - name: Update stack if present
-          uri:
-            url: "{{ portainer_url }}/api/stacks/{{ the_stack_id }}?endpointId={{ item.id }}"
-            method: PUT
-            headers: "{{ headers }}"
-            body: "{{ payload }}"
-            body_format: json
-            validate_certs: false
-            status_code: [200]
-          when:
-            - create_res.status not in [200,201]
-            - the_stack_id | int > 0
-      loop: "{{ endpoints }}"
+    - name: Create or update stack {{ stack.name }}
+      include_tasks: "tasks/portainer_stack.yml"
+      loop: "{{ stacks }}"
       loop_control:
-        label: "{{ item.name }}"
+        loop_var: stack
+        label: "{{ stack.name }}"
+      vars:
+        # variables que consumirá tasks/portainer_stack.yml
+        portainer_url: "{{ portainer_url }}"
+        portainer_api_token: "{{ portainer_api_token }}"
+        validate_certs: "{{ validate_certs }}"
+        stack: "{{ stack }}"
