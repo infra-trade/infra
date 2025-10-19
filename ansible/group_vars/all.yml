@@ -1,10 +1,8 @@
 # ---- Portainer (CE 2.33.2) ----
 portainer_url: "https://10.20.0.12:9443"
+portainer_token: ""   # usa variable de entorno mejor
 
-# Puedes dejar el token vacío si lo exportas por entorno (recomendado)
-portainer_token: ""
-
-# Mapa de Endpoints (Name => Id). RELLENA con tus IDs reales
+# Mapa Name -> EndpointId (pon tus IDs reales)
 endpoints:
   mon: 2
   airflow: 3

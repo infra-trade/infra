@@ -1,51 +1,11 @@
-all:
-  vars:
-    ansible_user: ansible
-    ansible_ssh_private_key_file: /home/ansible/.ssh/id_ed25519
-    ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
-    # Si quieres forzar sudo por defecto en todos los playbooks ad-hoc:
-    # ansible_become: true
-    # ansible_become_method: sudo
+# ---- Portainer (CE 2.33.2) ----
+portainer_url: "https://10.20.0.12:9443"
+portainer_token: ""   # usa variable de entorno mejor
 
-  children:
-    airflow:
-      hosts:
-        airflow-core:
-          ansible_host: 10.20.0.10
-
-    kafka:
-      hosts:
-        kafka-core:
-          ansible_host: 10.20.0.22
-
-    spark:
-      hosts:
-        spark-core:
-          ansible_host: 10.20.0.23
-
-    db:
-      hosts:
-        db-core:
-          ansible_host: 10.20.0.21
-
-    monitor:
-      hosts:
-        mon-core:
-          ansible_host: 10.20.0.12
-
-    # Nodos donde corre Portainer Agent u otros agentes
-    agent_nodes:
-      hosts:
-        airflow-core: {}
-        kafka-core: {}
-        spark-core: {}
-        db-core: {}
-
-    # Grupo comodín con todos los roles
-    core_vms:
-      children:
-        airflow: {}
-        kafka: {}
-        spark: {}
-        db: {}
-        monitor: {}
+# Mapa Name -> EndpointId (pon tus IDs reales)
+endpoints:
+  mon: 2
+  airflow: 3
+  kafka: 4
+  spark: 5
+  db: 6
