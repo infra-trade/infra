@@ -1,0 +1,4 @@
+# ejemplo genérico (ajústalo por VM)
+services:
+  hello:
+    image: hello-world

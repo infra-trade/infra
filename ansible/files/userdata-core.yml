@@ -1,0 +1,52 @@
+#cloud-config
+ssh_pwauth: false
+disable_root: true
+
+users:
+  - default
+  - name: ansible
+    groups: [adm, sudo]
+    shell: /bin/bash
+    lock_passwd: true
+    ssh_authorized_keys:
+      - ${SSH_PUBKEY}   # ← Ansible sustituirá este placeholder
+
+# Asegurar que la partición/dispositivo root crece hasta ocupar el disco
+growpart:
+  mode: auto
+  devices: ["/"]
+  ignore_growroot_disabled: false
+
+resize_rootfs: true
+
+# Preparar disco de datos (scsi1) y montarlo en /data por etiqueta
+runcmd:
+  - |
+    set -e
+    # Detectar disco extra sin FS (virtio suele ser vdb; scsi clásico sdb)
+    DISK=""
+    for CAND in /dev/vdb /dev/sdb; do
+      [ -b "$CAND" ] || continue
+      # Si ya tiene FS, lo saltamos
+      blkid "$CAND" >/dev/null 2>&1 && continue
+      DISK="$CAND"
+      break
+    done
+
+    if [ -n "$DISK" ]; then
+      # Particionar todo el disco y formatear ext4 con etiqueta DATA
+      parted -s "$DISK" mklabel gpt
+      parted -s "$DISK" mkpart primary 0% 100%
+      udevadm settle
+      mkfs.ext4 -F -L DATA "${DISK}1"
+    else
+      # Si ya existía partición, asegurar etiqueta
+      if [ -b /dev/vdb1 ]; then e2label /dev/vdb1 DATA || true; fi
+      if [ -b /dev/sdb1 ]; then e2label /dev/sdb1 DATA || true; fi
+    fi
+
+    mkdir -p /data
+    if ! grep -q "LABEL=DATA" /etc/fstab; then
+      echo "LABEL=DATA  /data  ext4  defaults,nofail,discard  0  2" >> /etc/fstab
+    fi
+    mount -a

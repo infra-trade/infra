@@ -1,0 +1,64 @@
+---
+- name: Deploy/upgrade Portainer CE on mon-core (always latest)
+  hosts: monitor
+  become: true
+  gather_facts: false
+
+  collections:
+    - community.docker
+
+  vars:
+    portainer_dir: /opt/portainer
+    compose_file: /opt/portainer/docker-compose.yml
+    portainer_https_port: 9443
+    portainer_http_port: 9000         # si no quieres http, elimina este publish
+    portainer_image: "portainer/portainer-ce:latest"  # <- siempre la última
+
+  tasks:
+    - name: Ensure compose dir exists
+      file:
+        path: "{{ portainer_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Ensure data volume exists
+      command: docker volume create portainer_data
+      register: vol
+      changed_when: "'portainer_data' in vol.stdout or vol.rc == 0"
+      failed_when: vol.rc not in [0]
+
+    - name: Write docker-compose (Portainer server)
+      copy:
+        dest: "{{ compose_file }}"
+        mode: "0644"
+        content: |
+          services:
+            portainer:
+              image: {{ portainer_image }}
+              container_name: portainer
+              restart: unless-stopped
+              ports:
+                - "{{ portainer_http_port }}:9000"
+                - "{{ portainer_https_port }}:9443"
+              volumes:
+                - portainer_data:/data
+                - /var/run/docker.sock:/var/run/docker.sock
+          volumes:
+            portainer_data: {}
+
+    - name: Pull latest image
+      command: docker compose -f {{ compose_file }} pull
+      args:
+        chdir: "{{ portainer_dir }}"
+
+    - name: Up/upgrade Portainer (recreate if needed)
+      command: docker compose -f {{ compose_file }} up -d --remove-orphans
+      args:
+        chdir: "{{ portainer_dir }}"
+
+    - name: Show URL
+      debug:
+        msg:
+          - "Portainer listo:"
+          - "  https://{{ hostvars[inventory_hostname].ansible_host | default(inventory_hostname) }}:{{ portainer_https_port }}"
+          - "Si fue primer arranque, crea el usuario admin al acceder."

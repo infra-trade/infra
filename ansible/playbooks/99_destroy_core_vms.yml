@@ -1,0 +1,78 @@
+---
+- name: Stop & destroy core VMs on Proxmox (purge disks)
+  hosts: localhost
+  gather_facts: false
+
+  collections:
+    - community.proxmox
+
+  vars:
+    # === Proxmox API ===
+    pm_api_host: "192.168.100.100"
+    pm_api_user: "ansible@pve"
+    pm_api_token_id: "api"
+    pm_api_token_secret: "{{ lookup('env','PM_API_TOKEN_SECRET') }}"
+    pm_node: "pve1"
+    validate_certs: false
+
+    # === Catálogo de VMs a borrar ===
+    vms:
+      airflow-core: { vmid: 9301 }
+      kafka-core:   { vmid: 9302 }
+      spark-core:   { vmid: 9303 }
+      db-core:      { vmid: 9304 }
+      mon-core:     { vmid: 9305 }
+
+  tasks:
+    - name: Check token is present in environment
+      assert:
+        that: pm_api_token_secret | length > 0
+        fail_msg: "Exporta PM_API_TOKEN_SECRET con el valor del token secreto."
+        success_msg: "Token presente en entorno."
+
+    - name: Build VM list (dict -> list)
+      set_fact:
+        vm_list: "{{ vms | dict2items }}"
+
+    - name: Stop each VM if it is running (ignore if absent)
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ pm_api_host }}"
+        api_user: "{{ pm_api_user }}"
+        api_token_id: "{{ pm_api_token_id }}"
+        api_token_secret: "{{ pm_api_token_secret }}"
+        validate_certs: "{{ validate_certs }}"
+        node: "{{ pm_node }}"
+        vmid: "{{ item.value.vmid }}"
+        state: stopped
+        force: true           # intenta apagado forzado si no responde
+        timeout: 120
+      loop: "{{ vm_list }}"
+      register: stop_results
+      failed_when: false      # si no existe la VM, no falla
+
+    - name: Small wait after stop
+      wait_for:
+        timeout: 5
+
+    - name: Delete each VM (purge disks; ignore if not found)
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ pm_api_host }}"
+        api_user: "{{ pm_api_user }}"
+        api_token_id: "{{ pm_api_token_id }}"
+        api_token_secret: "{{ pm_api_token_secret }}"
+        validate_certs: "{{ validate_certs }}"
+        node: "{{ pm_node }}"
+        vmid: "{{ item.value.vmid }}"
+        state: absent
+        purge: true           # elimina discos/datos
+        force: true           # elimina aunque haya locks residuales
+        timeout: 180
+      loop: "{{ vm_list }}"
+      register: delete_results
+      failed_when: false
+
+    - name: Summary
+      debug:
+        msg:
+          - "Intento de stop: {{ vm_list | map(attribute='key') | list }}"
+          - "Borradas (o ya no existentes): {{ delete_results.results | map(attribute='item.key') | list }}"

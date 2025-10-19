@@ -1,0 +1,27 @@
+# Python / venv
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# Ansible cache
+*.retry
+.fact_cache/
+.cache/
+
+# Claves y secretos (mantén vaults encriptados)
+*.vault.pass
+*.secret
+*.pem
+*.key
+
+# Docker y build
+**/.DS_Store
+**/.idea/
+**/.vscode/
+
+# Colecciones descargadas localmente (reinstalar con requirements.yml)
+ansible/collections/ansible_collections/
+
+# Archivos temporales
+*.log

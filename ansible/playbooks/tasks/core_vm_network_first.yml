@@ -1,0 +1,112 @@
+---
+# Tareas por VM (se incluye desde 21_create_core_vms.yml con loop_var=vm_item)
+# Requiere variables definidas en el play principal:
+# pm_api_host, pm_api_user, pm_api_token_id, pm_api_token_secret, pm_node, validate_certs
+# template_name, storage_system, snippets_store, snippet_name
+# net_bridge, vlan_tag, vlan_gateway, dns_string
+# ssh_wait_timeout
+# vm_item.key (nombre VM) / vm_item.value.{vmid,cpu,mem,disk_gb,ip,data_disk_gb}
+
+- name: Eliminar VM previa (best-effort)
+  community.proxmox.proxmox_kvm:
+    api_host: "{{ pm_api_host }}"
+    api_user: "{{ pm_api_user }}"
+    api_token_id: "{{ pm_api_token_id }}"
+    api_token_secret: "{{ pm_api_token_secret }}"
+    validate_certs: "{{ validate_certs }}"
+    node: "{{ pm_node }}"
+    vmid: "{{ vm_item.value.vmid }}"
+    state: absent
+    purge: true
+    force: true
+  failed_when: false
+
+- name: Clonar desde template (mínimo, sin red/ip aquí)
+  community.proxmox.proxmox_kvm:
+    api_host: "{{ pm_api_host }}"
+    api_user: "{{ pm_api_user }}"
+    api_token_id: "{{ pm_api_token_id }}"
+    api_token_secret: "{{ pm_api_token_secret }}"
+    validate_certs: "{{ validate_certs }}"
+    node: "{{ pm_node }}"
+    name: "{{ vm_item.key }}"
+    newid: "{{ vm_item.value.vmid }}"
+    clone: "{{ template_name }}"
+    full: true
+    storage: "{{ storage_system }}"
+    memory: "{{ vm_item.value.mem }}"
+    cores: "{{ vm_item.value.cpu }}"
+    scsihw: virtio-scsi-single
+    state: present
+    timeout: 240
+
+# Cicustom: user-data (común) + meta-data (hostname por VM)
+- name: Subir meta-data (hostname) para {{ vm_item.key }}
+  copy:
+    dest: "/var/lib/vz/snippets/meta-{{ vm_item.key }}.yml"
+    mode: "0644"
+    content: |
+      instance-id: {{ vm_item.value.vmid }}
+      local-hostname: {{ vm_item.key }}
+  delegate_to: "{{ pm_api_host }}"
+  become: true
+
+- name: Forzar cloud-init + NIC vmbr1/VLAN e IP (update) usando cicustom (user+meta)
+  community.proxmox.proxmox_kvm:
+    api_host: "{{ pm_api_host }}"
+    api_user: "{{ pm_api_user }}"
+    api_token_id: "{{ pm_api_token_id }}"
+    api_token_secret: "{{ pm_api_token_secret }}"
+    validate_certs: "{{ validate_certs }}"
+    node: "{{ pm_node }}"
+    vmid: "{{ vm_item.value.vmid }}"
+    update: true
+    # Disco de cloud-init
+    ide:
+      ide2: "{{ storage_system }}:cloudinit"
+    citype: "nocloud"
+    # user-data común (snippet_name) + meta-data por VM (hostname)
+    cicustom: "user={{ snippets_store }}:snippets/{{ snippet_name }},meta={{ snippets_store }}:snippets/meta-{{ vm_item.key }}.yml"
+
+    # Red/IP por cloud-init
+    ipconfig:
+      ipconfig0: "ip={{ vm_item.value.ip }},gw={{ vlan_gateway }}"
+    nameservers: "{{ dns_string }}"
+    net:
+      net0: "virtio,bridge={{ net_bridge }},tag={{ vlan_tag }}"
+
+    # Extras
+    agent: 1
+    onboot: true
+    timeout: 240
+
+- name: Arrancar VM
+  community.proxmox.proxmox_kvm:
+    api_host: "{{ pm_api_host }}"
+    api_user: "{{ pm_api_user }}"
+    api_token_id: "{{ pm_api_token_id }}"
+    api_token_secret: "{{ pm_api_token_secret }}"
+    validate_certs: "{{ validate_certs }}"
+    node: "{{ pm_node }}"
+    vmid: "{{ vm_item.value.vmid }}"
+    state: started
+    timeout: 240
+
+- name: Esperar a que SSH responda
+  wait_for:
+    host: "{{ (vm_item.value.ip | string).split('/')[0] }}"
+    port: 22
+    delay: 5
+    timeout: "{{ ssh_wait_timeout }}"
+
+# === Opción A (recomendada): añadir disco de datos con `qm set`
+# IMPORTANTE: en local-lvm (LVM-thin) el tamaño NO lleva sufijo "G", se pasa solo el número (GB).
+- name: Añadir disco de datos scsi1 (thin) con qm set
+  delegate_to: "{{ pm_api_host }}"
+  become: true
+  command: >
+    qm set {{ vm_item.value.vmid }}
+    --scsi1 {{ storage_system }}:{{ vm_item.value.data_disk_gb }},ssd=1,discard=on,iothread=1
+  when:
+    - vm_item.value.data_disk_gb is defined
+    - vm_item.value.data_disk_gb|int > 0

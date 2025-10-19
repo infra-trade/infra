@@ -1,0 +1,17 @@
+---
+- name: Clone VM from template
+  community.proxmox.proxmox_kvm:
+    api_host: "{{ pm_api_host }}"
+    api_user: "{{ pm_api_user }}"
+    api_token_id: "{{ pm_api_token_id }}"
+    api_token_secret: "{{ pm_api_token_secret }}"
+    validate_certs: "{{ validate_certs }}"
+    node: "{{ pm_node }}"
+    name: "{{ item.key }}"
+    newid: "{{ item.value.vmid }}"
+    clone: "{{ template_name }}"
+    full: true
+    storage: "{{ proxmox_storage }}"
+    memory: "{{ item.value.mem }}"
+    cores: "{{ item.value.cpu }}"
+    state: present

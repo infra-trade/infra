@@ -1,0 +1,95 @@
+---
+- name: Deploy app stacks with rsync + docker compose (per role)
+  hosts: core_vms
+  become: true
+  gather_facts: false
+
+  vars:
+    # Mapa host->app y rutas
+    app_map:
+      airflow-core: { app: "airflow", dest: "/opt/airflow" }
+      kafka-core:   { app: "kafka",   dest: "/opt/kafka"   }
+      spark-core:   { app: "spark",   dest: "/opt/spark"   }
+      db-core:      { app: "db",      dest: "/opt/db"      }
+      mon-core:     { app: "mon",     dest: "/opt/mon"     }
+
+    # Raíz local del repo (ajusta si cambiaste layout)
+    repo_root: "{{ playbook_dir }}/../.."
+
+  tasks:
+    - name: Determine my_app by group (trim-safe)
+      set_fact:
+        my_app: "{{ app_map[inventory_hostname].app }}"
+        dest_dir: "{{ app_map[inventory_hostname].dest }}"
+
+    - name: Fail if app not recognized
+      fail:
+        msg: "Unknown app mapping for {{ inventory_hostname }}"
+      when: my_app is not defined or dest_dir is not defined
+
+    - name: Check local source exists for {{ my_app }}
+      delegate_to: localhost
+      run_once: false
+      stat:
+        path: "{{ repo_root }}/{{ my_app }}/compose"
+      register: local_src
+
+    - name: Fail if local source missing (fix your repo layout)
+      when: not local_src.stat.exists
+      fail:
+        msg: "Local path {{ repo_root }}/{{ my_app }}/compose does not exist on controller."
+
+    - name: Ensure destination exists
+      file:
+        path: "{{ dest_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Verify Docker is present (binary)
+      command: docker --version
+      register: docker_ver
+      changed_when: false
+
+    # === CORRECCIÓN PRINCIPAL: synchronize SIN ssh_args ===
+    - name: Sync project dir (rsync) from controller to host
+      delegate_to: localhost
+      become: false
+      ansible.posix.synchronize:
+        src: "{{ repo_root }}/{{ my_app }}/compose/"
+        dest: "{{ dest_dir }}/"
+        mode: push
+        archive: yes
+        compress: yes
+        delete: yes
+        # Ejecuta rsync con sudo en el lado REMOTO
+        rsync_path: "sudo rsync"
+        # Hereda ansible_ssh_common_args del inventario
+        use_ssh_args: yes
+        # Si quisieras forzar una llave distinta a la del inventario:
+        # private_key: /home/ansible/.ssh/id_ed25519
+        # Opcional: flags extras de rsync
+        rsync_opts:
+          - "--chmod=Du=rwx,Dgo=rx,Fu=rw,Fgo=r"
+
+    - name: Check docker-compose.yml exists on remote
+      stat:
+        path: "{{ dest_dir }}/docker-compose.yml"
+      register: compose_remote
+
+    - name: Compose up (only if compose file exists)
+      shell: |
+        set -e
+        docker compose -f "{{ dest_dir }}/docker-compose.yml" up -d
+      when: compose_remote.stat.exists
+      args:
+        chdir: "{{ dest_dir }}"
+
+    - name: Show containers
+      shell: >
+        docker ps --format 'table {{'{{'}}.Names{{'}}'}}\t{{'{{'}}.Status{{'}}'}}\t{{'{{'}}.Ports{{'}}'}}'
+      register: ps_out
+      changed_when: false
+
+    - name: Print docker ps
+      debug:
+        msg: "{{ ps_out.stdout_lines }}"

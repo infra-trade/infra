@@ -1,0 +1,24 @@
+---
+- name: Force NIC + cloud-init settings
+  community.proxmox.proxmox_kvm:
+    api_host: "{{ pm_api_host }}"
+    api_user: "{{ pm_api_user }}"
+    api_token_id: "{{ pm_api_token_id }}"
+    api_token_secret: "{{ pm_api_token_secret }}"
+    validate_certs: "{{ validate_certs }}"
+    node: "{{ pm_node }}"
+    vmid: "{{ item.value.vmid }}"
+    update: true
+    ide:
+      ide2: "{{ proxmox_storage }}:cloudinit"
+    citype: "nocloud"
+    ciuser: "{{ ci_user }}"
+    cipassword: "{{ ci_password if ci_password|length>0 else omit }}"
+    sshkeys: "{{ (lookup('file', ssh_pubkey_path)) | trim }}"
+    ipconfig:
+      ipconfig0: "ip={{ item.value.ip }},gw={{ vlan_gateway }}"
+    nameservers: "{{ dns_servers | join(' ') }}"
+    net:
+      net0: "virtio,bridge={{ net_bridge }},tag={{ vlan_tag }}"
+    agent: 1
+    onboot: true

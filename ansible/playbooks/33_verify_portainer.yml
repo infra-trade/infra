@@ -1,0 +1,14 @@
+---
+- name: Verify Portainer server and agent containers
+  hosts: monitor:agent_nodes
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Check portainer/agent containers
+      shell: docker ps --format '{{"{{"}}.Names{{"}}"}} {{ "{{"}}.Image{{ "}}" }} {{ "{{"}}.Ports{{ "}}" }}'
+      register: ps
+      changed_when: false
+
+    - debug:
+        var: ps.stdout_lines

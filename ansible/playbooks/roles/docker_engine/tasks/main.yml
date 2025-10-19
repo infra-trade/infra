@@ -1,0 +1,61 @@
+# --- AÑADIR REPO OFICIAL DOCKER DE FORMA SEGURA Y SIN CUELGUES ---
+
+- name: Ensure keyrings dir
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: '0755'
+  become: true
+
+- name: Download Docker GPG key (get_url)
+  ansible.builtin.get_url:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    dest: /etc/apt/keyrings/docker.gpg
+    mode: '0644'
+    force: true
+  become: true
+  register: docker_key
+  retries: 3
+  delay: 3
+  until: docker_key is succeeded
+
+# Nota: Key moderna ya viene en formato ASCII. apt usa "signed-by=" con ese path.
+
+- name: Add Docker apt repo (jammy)
+  ansible.builtin.apt_repository:
+    repo: "deb [arch={{ ansible_architecture | default('amd64') }} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu jammy stable"
+    filename: docker
+    state: present
+  become: true
+
+- name: apt-get update (IPv4 + retries)
+  ansible.builtin.shell: >
+    DEBIAN_FRONTEND=noninteractive
+    apt-get -o Acquire::ForceIPv4=true -o APT::Acquire::Retries=3 update
+  args:
+    warn: false
+  become: true
+  register: aptupd
+  retries: 3
+  delay: 5
+  until: aptupd.rc == 0
+
+- name: Install Docker Engine packages (with retries)
+  ansible.builtin.shell: >
+    DEBIAN_FRONTEND=noninteractive
+    apt-get install -y
+    docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  args:
+    warn: false
+  become: true
+  register: docker_install
+  retries: 3
+  delay: 5
+  until: docker_install.rc == 0
+
+- name: Enable & start Docker
+  ansible.builtin.systemd:
+    name: docker
+    enabled: true
+    state: started
+  become: true

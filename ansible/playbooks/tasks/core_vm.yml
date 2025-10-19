@@ -1,0 +1,81 @@
+---
+# playbooks/tasks/core_vm.yml
+
+- name: Eliminar VM previa (best-effort)
+  community.proxmox.proxmox_kvm:
+    api_host: "{{ pm_api_host }}"
+    api_user: "{{ pm_api_user }}"
+    api_token_id: "{{ pm_api_token_id }}"
+    api_token_secret: "{{ pm_api_token_secret }}"
+    validate_certs: "{{ validate_certs }}"
+    node: "{{ pm_node }}"
+    vmid: "{{ vm.vmid }}"
+    state: absent
+    purge: true
+    force: true
+  failed_when: false
+
+- name: Clonar desde template (root disk + data disk + cloud-init + red)
+  community.proxmox.proxmox_kvm:
+    api_host: "{{ pm_api_host }}"
+    api_user: "{{ pm_api_user }}"
+    api_token_id: "{{ pm_api_token_id }}"
+    api_token_secret: "{{ pm_api_token_secret }}"
+    validate_certs: "{{ validate_certs }}"
+    node: "{{ pm_node }}"
+    name: "{{ vm_name }}"
+    newid: "{{ vm.vmid }}"
+    clone: "{{ template_name }}"
+    full: true
+    storage: "{{ storage_system }}"
+    memory: "{{ vm.mem }}"
+    cores: "{{ vm.cpu }}"
+    scsihw: "virtio-scsi-single"
+    agent: 1
+    onboot: true
+
+    # NIC vmbr1 + VLAN
+    net:
+      net0: "virtio,bridge={{ net_bridge }},tag={{ vlan_tag }}"
+
+    # Disco cloud-init
+    ide:
+      ide2: "{{ storage_system }}:cloudinit"
+    citype: "nocloud"
+
+    # IP estática y DNS
+    ipconfig:
+      ipconfig0: "ip={{ vm.ip }},gw={{ vlan_gateway }}"
+    nameservers: "{{ dns_string }}"
+
+    # Discos (creación en el mismo paso)
+    scsi:
+      scsi0: "{{ storage_system }}:{{ vm.disk_gb }}G,ssd=1,discard=on,iothread=1"
+      scsi1: "{{ storage_system }}:{{ vm.data_disk_gb }}G,ssd=1,discard=on,iothread=1"
+
+    # user-data común (grow de / + /data vía cloud-init)
+    cicustom: "user=local:snippets/{{ snippet_name }}"
+
+    state: present
+    timeout: 300
+
+- name: Arrancar VM
+  community.proxmox.proxmox_kvm:
+    api_host: "{{ pm_api_host }}"
+    api_user: "{{ pm_api_user }}"
+    api_token_id: "{{ pm_api_token_id }}"
+    api_token_secret: "{{ pm_api_token_secret }}"
+    validate_certs: "{{ validate_certs }}"
+    node: "{{ pm_node }}"
+    vmid: "{{ vm.vmid }}"
+    state: started
+    timeout: 180
+
+- name: Mostrar resumen de la VM
+  debug:
+    msg:
+      - "VM {{ vm_name }} (vmid={{ vm.vmid }}) arrancada."
+      - "Root: {{ vm.disk_gb }}G (growpart/resizefs en primer boot)"
+      - "Data: {{ vm.data_disk_gb }}G -> /data (LABEL=DATA via cloud-init)"
+      - "Red: {{ net_bridge }} VLAN {{ vlan_tag }} IP {{ vm.ip }} GW {{ vlan_gateway }}"
+      - "DNS: {{ dns_string }}"
