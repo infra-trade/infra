@@ -1,0 +1,84 @@
+---
+- name: Manage Portainer Git Stacks (create/update from mono-repo)
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    portainer_url: "https://mon-core:9443"
+    portainer_token: "{{ lookup('env','PORTAINER_TOKEN') | default('', true) }}"
+    repo_url: "git@github.com:infra-trade/infra.git"
+    git_ref: "main"
+
+    # Pon aquí los IDs reales de cada endpoint (agente)
+    endpoints:
+      - { name: "airflow-core", id: 2, compose_path: "airflow/compose/docker-compose.yml", stack_name: "airflow-core" }
+      - { name: "kafka-core",   id: 3, compose_path: "kafka/compose/docker-compose.yml",   stack_name: "kafka-core" }
+      - { name: "spark-core",   id: 4, compose_path: "spark/compose/docker-compose.yml",   stack_name: "spark-core" }
+      - { name: "db-core",      id: 5, compose_path: "db/compose/docker-compose.yml",      stack_name: "db-core" }
+      - { name: "mon-core",     id: 1, compose_path: "mon/compose/docker-compose.yml",     stack_name: "mon-core" }
+
+  tasks:
+    - name: Fail if PORTAINER_TOKEN missing
+      fail:
+        msg: "Define PORTAINER_TOKEN env var con tu Access Token de Portainer (My account → Add access token)."
+      when: portainer_token | length == 0
+
+    - name: Ensure stacks from Git (create or update)
+      vars:
+        headers:
+          Authorization: "Bearer {{ portainer_token }}"
+          Accept: "application/json"
+          Content-Type: "application/json"
+        payload: |
+          {
+            "name": "{{ item.stack_name }}",
+            "repositoryURL": "{{ repo_url }}",
+            "repositoryReferenceName": "{{ git_ref }}",
+            "composeFilePathInRepository": "{{ item.compose_path }}",
+            "autoUpdate": {
+              "interval": "5m",
+              "webhook": false
+            }
+          }
+      block:
+        - name: Try create (POST /stacks/create?type=2&method=repository&endpointId=ID)
+          uri:
+            url: "{{ portainer_url }}/api/stacks/create?type=2&method=repository&endpointId={{ item.id }}"
+            method: POST
+            headers: "{{ headers }}"
+            body: "{{ payload }}"
+            body_format: json
+            validate_certs: false
+            status_code: [200, 201]
+          register: create_res
+          failed_when: false
+
+        - name: If exists, update (PUT /stacks/{id}) — first, find stack by name
+          uri:
+            url: "{{ portainer_url }}/api/stacks"
+            method: GET
+            headers: "{{ headers }}"
+            validate_certs: false
+          register: stacks_list
+          when: create_res.status not in [200,201]
+
+        - name: Compute stack_id by name
+          set_fact:
+            the_stack_id: "{{ (stacks_list.json | selectattr('Name','equalto', item.stack_name) | list | first).Id | default(0) }}"
+          when: create_res.status not in [200,201]
+
+        - name: Update stack if present
+          uri:
+            url: "{{ portainer_url }}/api/stacks/{{ the_stack_id }}?endpointId={{ item.id }}"
+            method: PUT
+            headers: "{{ headers }}"
+            body: "{{ payload }}"
+            body_format: json
+            validate_certs: false
+            status_code: [200]
+          when:
+            - create_res.status not in [200,201]
+            - the_stack_id | int > 0
+      loop: "{{ endpoints }}"
+      loop_control:
+        label: "{{ item.name }}"
