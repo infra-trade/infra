@@ -1,11 +1,13 @@
-# ansible/group_vars/all.yml
+# ---- Portainer (CE 2.33.2) ----
 portainer_url: "https://10.20.0.12:9443"
 
+# Puedes dejar el token vacío si lo exportas por entorno (recomendado)
+portainer_token: ""
+
+# Mapa de Endpoints (Name => Id). RELLENA con tus IDs reales
 endpoints:
   mon: 2
-  airflow: 2
-  kafka: 2
-  spark: 2
-  db: 2
-
-git_default_ref: "main"
+  airflow: 3
+  kafka: 4
+  spark: 5
+  db: 6
