@@ -1,75 +1,43 @@
 ---
-# Crea/actualiza stacks de Portainer desde un repositorio Git PRIVADO (CE 2.33.2 LTS)
+# Create/Update Portainer stacks from a private Git repo (Portainer CE 2.33.2)
 # Requiere:
-# - group_vars/all.yml:    portainer_url, endpoints (mapa), git_default_ref (opcional)
-# - group_vars/all.vault.yml (Vault): github_username, github_pat
-# - Exportar PORTAINER_TOKEN en el entorno o definir portainer_token en vars
+# - group_vars/all.yml con:
+#     portainer_url: "https://10.20.0.12:9443"
+#     endpoints: { mon: 2, airflow: 3, kafka: 4, spark: 5, db: 6 }
+#     stacks:
+#       - { name: "mon",     endpoint: "mon",     repo_url: "https://github.com/infra-trade/infra.git", compose_path: "mon/compose/docker-compose.yml",     git_ref: "main", env: [] }
+#       - { name: "airflow", endpoint: "airflow", repo_url: "https://github.com/infra-trade/infra.git", compose_path: "airflow/compose/docker-compose.yml", git_ref: "main", env: [] }
+#       - { name: "kafka",   endpoint: "kafka",   repo_url: "https://github.com/infra-trade/infra.git", compose_path: "kafka/compose/docker-compose.yml",   git_ref: "main", env: [] }
+#       - { name: "spark",   endpoint: "spark",   repo_url: "https://github.com/infra-trade/infra.git", compose_path: "spark/compose/docker-compose.yml",   git_ref: "main", env: [] }
+#       - { name: "db",      endpoint: "db",      repo_url: "https://github.com/infra-trade/infra.git", compose_path: "db/compose/docker-compose.yml",      git_ref: "main", env: [] }
+#
+# - Token de Portainer como Access Token (no JWT de login). Exporta en el controlador:
+#     export PORTAINER_TOKEN='ptid_...'
+#   o define portainer_token en group_vars/all.yml
 
 - name: Create/Update Portainer stacks from Git (CE 2.33.2)
   hosts: mon-core
-  become: false
   gather_facts: false
-
-  vars:
-    # Define aquí tus stacks. Ajusta compose_path y endpoint según tu árbol de repo.
-    stacks:
-      - name: "mon"
-        endpoint: "mon"
-        repo_url: "https://github.com/infra-trade/infra.git"
-        compose_path: "mon/compose/docker-compose.yml"
-        git_ref: "main"
-        env: []
-
-      - name: "airflow"
-        endpoint: "airflow"
-        repo_url: "https://github.com/infra-trade/infra.git"
-        compose_path: "airflow/compose/docker-compose.yml"
-        git_ref: "main"
-        env: []
-
-      - name: "kafka"
-        endpoint: "kafka"
-        repo_url: "https://github.com/infra-trade/infra.git"
-        compose_path: "kafka/compose/docker-compose.yml"
-        git_ref: "main"
-        env: []
-
-      - name: "spark"
-        endpoint: "spark"
-        repo_url: "https://github.com/infra-trade/infra.git"
-        compose_path: "spark/compose/docker-compose.yml"
-        git_ref: "main"
-        env: []
-
-      - name: "db"
-        endpoint: "db"
-        repo_url: "https://github.com/infra-trade/infra.git"
-        compose_path: "db/compose/docker-compose.yml"
-        git_ref: "main"
-        env: []
+  become: false
 
   pre_tasks:
     - name: Resolver token (env primero, si no existe usa var portainer_token)
       ansible.builtin.set_fact:
-        portainer_api_token: >-
-          {{ lookup('env','PORTAINER_TOKEN') |
-             default(portainer_token | default('', true), true) }}
+        portainer_api_token: "{{ lookup('env','PORTAINER_TOKEN') | default(portainer_token | default('', true), true) }}"
 
     - name: Fallar si no hay token
       ansible.builtin.fail:
-        msg: "Falta PORTAINER_TOKEN (o var portainer_token). Expórtalo/defínelo antes de continuar."
+        msg: "No se encontró un Access Token de Portainer. Exporta PORTAINER_TOKEN o define portainer_token."
       when: portainer_api_token | length == 0
 
     - name: Verificar conectividad con Portainer
       ansible.builtin.uri:
         url: "{{ portainer_url }}/api/system/status"
         method: GET
-        headers:
-          Authorization: "Bearer {{ portainer_api_token }}"
         validate_certs: false
         return_content: true
         status_code: 200
-      register: _system_status
+      register: _ping
 
   tasks:
     - name: Crear/actualizar cada stack
