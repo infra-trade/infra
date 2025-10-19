@@ -5,8 +5,7 @@
   become: false
 
   vars:
-    portainer_base: "https://mon-core:9443/api"
-    portainer_api_key: "{{ lookup('env','PORTAINER_API_KEY') }}"  
+    portainer_url: "https://{{ hostvars[inventory_hostname].ansible_host | default(inventory_hostname) }}:9443"
     validate_certs: false
 
     endpoints:
