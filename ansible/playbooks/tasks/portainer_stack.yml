@@ -1,7 +1,7 @@
 ---
 # Requiere vars del item: st.name, st.endpoint, st.repo_url, st.compose_path, st.git_ref, st.env
 # Requiere vars del play: portainer_url, portainer_api_token, endpoints (mapa), portainer_validate_certs
-# Opcional (para repo privado por SSH): github_deploy_key -> ruta a key (p.ej. /home/ansible/.ssh/id_ed25519)
+# Opcional (repo privado por SSH): github_deploy_key (ruta a la key)
 
 - name: Resolver endpointId para {{ st.name }}
   ansible.builtin.set_fact:
@@ -14,7 +14,7 @@
     fail_msg: "No encuentro endpointId para '{{ st.endpoint }}' en 'endpoints: {}'"
     success_msg: "endpointId = {{ _endpoint_id }}"
 
-# === 1) Preparar compose: clonar y leer contenido (en el controlador) ===
+# === 1) Preparar compose localmente (control node) ===
 - name: Clonar repo {{ st.repo_url }} ({{ st.git_ref | default('main') }}) localmente
   ansible.builtin.git:
     repo: "{{ st.repo_url }}"
@@ -84,7 +84,7 @@
     msg:
       - "Stack '{{ st.name }}' en endpoint {{ _endpoint_id }} => {{ 'EXISTE' if _exists else 'NO EXISTE' }}"
 
-# === 3) Si existe: borrar (CE API file-mode no soporta update directo fiable) ===
+# === 3) Si existe: borrar (recreamos con compose string) ===
 - name: Borrar stack existente (si aplica)
   ansible.builtin.uri:
     url: "{{ portainer_url }}/api/stacks/{{ _existing_stack.Id }}?endpointId={{ _endpoint_id }}"
@@ -97,23 +97,46 @@
   register: _delete_resp
   changed_when: _exists
 
-# === 4) Crear stack con contenido de compose (método FILE/STRING vía endpoint JSON) ===
-# Usamos el endpoint "create compose" que acepta JSON con stackFileContent (evita multipart).
-- name: Crear stack desde contenido de compose
-  ansible.builtin.uri:
-    url: "{{ portainer_url }}/api/stacks/create/compose?type=2&endpointId={{ _endpoint_id }}"
-    method: POST
-    headers:
-      X-API-Key: "{{ portainer_api_token }}"
-      Content-Type: "application/json"
-    validate_certs: "{{ portainer_validate_certs }}"
-    body_format: json
-    body:
-      name: "{{ st.name }}"
-      stackFileContent: "{{ _compose_content }}"
-      prune: true
-      pullImage: true
-      env: "{{ st.env | default([]) }}"
-    status_code: [200, 201]
-  register: _create_resp
-  changed_when: true
+# === 4) Crear stack (CE) con method=string ===
+# Intento 1: JSON (algunas CE lo aceptan)
+- name: Crear stack desde contenido de compose (JSON)
+  block:
+    - name: POST /api/stacks?type=2&method=string&endpointId={{ _endpoint_id }} (JSON)
+      ansible.builtin.uri:
+        url: "{{ portainer_url }}/api/stacks?type=2&method=string&endpointId={{ _endpoint_id }}"
+        method: POST
+        headers:
+          X-API-Key: "{{ portainer_api_token }}"
+          Content-Type: "application/json"
+        validate_certs: "{{ portainer_validate_certs }}"
+        body_format: json
+        body:
+          # Portainer CE suele aceptar minúsculas en JSON:
+          name: "{{ st.name }}"
+          stackFileContent: "{{ _compose_content }}"
+          env: "{{ st.env | default([]) }}"
+          prune: true
+          pullImage: true
+        status_code: [200, 201]
+      register: _create_json
+      changed_when: true
+  rescue:
+    # Intento 2: multipart (forma clásica y más compatible en CE)
+    - name: Crear stack desde contenido de compose (multipart fallback)
+      community.general.uri:
+        url: "{{ portainer_url }}/api/stacks?type=2&method=string&endpointId={{ _endpoint_id }}"
+        method: POST
+        headers:
+          X-API-Key: "{{ portainer_api_token }}"
+        validate_certs: "{{ portainer_validate_certs }}"
+        body_format: form-multipart
+        body:
+          Name: "{{ st.name }}"
+          StackFileContent: "{{ _compose_content }}"
+          Prune: "true"
+          PullImage: "true"
+          # Env debe ser JSON string si lo usas:
+          Env: "{{ (st.env | default([])) | to_json }}"
+        status_code: [200, 201]
+      register: _create_multipart
+      changed_when: true
