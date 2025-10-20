@@ -1,24 +1,12 @@
 ---
-# Create/Update Portainer stacks from a private Git repo (Portainer CE 2.33.2)
-# Requiere:
-# - group_vars/all.yml con:
-#     portainer_url: "https://10.20.0.12:9443"
-#     endpoints: { mon: 2, airflow: 3, kafka: 4, spark: 5, db: 6 }
-#     stacks:
-#       - { name: "mon",     endpoint: "mon",     repo_url: "https://github.com/infra-trade/infra.git", compose_path: "mon/compose/docker-compose.yml",     git_ref: "main", env: [] }
-#       - { name: "airflow", endpoint: "airflow", repo_url: "https://github.com/infra-trade/infra.git", compose_path: "airflow/compose/docker-compose.yml", git_ref: "main", env: [] }
-#       - { name: "kafka",   endpoint: "kafka",   repo_url: "https://github.com/infra-trade/infra.git", compose_path: "kafka/compose/docker-compose.yml",   git_ref: "main", env: [] }
-#       - { name: "spark",   endpoint: "spark",   repo_url: "https://github.com/infra-trade/infra.git", compose_path: "spark/compose/docker-compose.yml",   git_ref: "main", env: [] }
-#       - { name: "db",      endpoint: "db",      repo_url: "https://github.com/infra-trade/infra.git", compose_path: "db/compose/docker-compose.yml",      git_ref: "main", env: [] }
-#
-# - Token de Portainer como Access Token (no JWT de login). Exporta en el controlador:
-#     export PORTAINER_TOKEN='ptid_...'
-#   o define portainer_token en group_vars/all.yml
-
 - name: Create/Update Portainer stacks from Git (CE 2.33.2)
   hosts: mon-core
+  become: true
   gather_facts: false
-  become: false
+
+  vars:
+    # Si tu cert es self-signed, deja en false
+    portainer_validate_certs: false
 
   pre_tasks:
     - name: Resolver token (env primero, si no existe usa var portainer_token)
@@ -27,17 +15,29 @@
 
     - name: Fallar si no hay token
       ansible.builtin.fail:
-        msg: "No se encontró un Access Token de Portainer. Exporta PORTAINER_TOKEN o define portainer_token."
+        msg: "No hay token para Portainer. Exporta PORTAINER_TOKEN o define portainer_token."
       when: portainer_api_token | length == 0
+
+    - name: Verificar que existan variables requeridas
+      ansible.builtin.assert:
+        that:
+          - portainer_url is defined
+          - stacks is defined
+          - stacks | length > 0
+          - endpoints is defined
+        fail_msg: "Faltan variables: portainer_url, stacks o endpoints. Revisa group_vars/all.yml."
+        success_msg: "Variables básicas presentes."
 
     - name: Verificar conectividad con Portainer
       ansible.builtin.uri:
         url: "{{ portainer_url }}/api/system/status"
         method: GET
-        validate_certs: false
+        headers:
+          X-API-Key: "{{ portainer_api_token }}"
+        validate_certs: "{{ portainer_validate_certs }}"
         return_content: true
         status_code: 200
-      register: _ping
+      register: _status
 
   tasks:
     - name: Crear/actualizar cada stack
