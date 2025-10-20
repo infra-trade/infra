@@ -1,6 +1,7 @@
 ---
 # Requiere vars del item: st.name, st.endpoint, st.repo_url, st.compose_path, st.git_ref, st.env
 # Requiere vars del play: portainer_url, portainer_api_token, endpoints (mapa), portainer_validate_certs
+# Opcional (para repo privado por SSH): github_deploy_key -> ruta a key (p.ej. /home/ansible/.ssh/id_ed25519)
 
 - name: Resolver endpointId para {{ st.name }}
   ansible.builtin.set_fact:
@@ -13,7 +14,45 @@
     fail_msg: "No encuentro endpointId para '{{ st.endpoint }}' en 'endpoints: {}'"
     success_msg: "endpointId = {{ _endpoint_id }}"
 
-# 1) Listar stacks existentes y buscar uno por nombre+endpoint
+# === 1) Preparar compose: clonar y leer contenido (en el controlador) ===
+- name: Clonar repo {{ st.repo_url }} ({{ st.git_ref | default('main') }}) localmente
+  ansible.builtin.git:
+    repo: "{{ st.repo_url }}"
+    dest: "/tmp/portainer_repos/{{ st.name }}"
+    version: "{{ st.git_ref | default('main') }}"
+    accept_hostkey: true
+    key_file: "{{ github_deploy_key | default(omit) }}"
+    update: true
+    force: true
+  delegate_to: localhost
+  run_once: true
+
+- name: Verificar archivo compose existe
+  ansible.builtin.stat:
+    path: "/tmp/portainer_repos/{{ st.name }}/{{ st.compose_path }}"
+  register: _compose_stat
+  delegate_to: localhost
+  run_once: true
+
+- name: Fallar si no existe el compose
+  ansible.builtin.fail:
+    msg: "No se encuentra el compose en {{ st.compose_path }} para stack {{ st.name }}"
+  when: not _compose_stat.stat.exists
+  delegate_to: localhost
+  run_once: true
+
+- name: Leer contenido del compose
+  ansible.builtin.slurp:
+    path: "/tmp/portainer_repos/{{ st.name }}/{{ st.compose_path }}"
+  register: _compose_b64
+  delegate_to: localhost
+  run_once: true
+
+- name: Guardar contenido compose decodificado
+  ansible.builtin.set_fact:
+    _compose_content: "{{ _compose_b64.content | b64decode }}"
+
+# === 2) Descubrir si el stack existe ===
 - name: Listar stacks existentes (Portainer)
   ansible.builtin.uri:
     url: "{{ portainer_url }}/api/stacks"
@@ -45,12 +84,24 @@
     msg:
       - "Stack '{{ st.name }}' en endpoint {{ _endpoint_id }} => {{ 'EXISTE' if _exists else 'NO EXISTE' }}"
 
-# 2) Crear si NO existe: type=2 (compose), method=repository (desde Git)
-# Nota: En CE 2.33.2, Portainer API puede responder 405 para creación desde Git.
-# Si ves 405, esa feature no está disponible en tu edición/config y debes usar 35_deploy_stacks_compose.yml.
-- name: Crear stack (si NO existe)
+# === 3) Si existe: borrar (CE API file-mode no soporta update directo fiable) ===
+- name: Borrar stack existente (si aplica)
   ansible.builtin.uri:
-    url: "{{ portainer_url }}/api/stacks?type=2&method=repository&endpointId={{ _endpoint_id }}"
+    url: "{{ portainer_url }}/api/stacks/{{ _existing_stack.Id }}?endpointId={{ _endpoint_id }}"
+    method: DELETE
+    headers:
+      X-API-Key: "{{ portainer_api_token }}"
+    validate_certs: "{{ portainer_validate_certs }}"
+    status_code: 204
+  when: _exists
+  register: _delete_resp
+  changed_when: _exists
+
+# === 4) Crear stack con contenido de compose (método FILE/STRING vía endpoint JSON) ===
+# Usamos el endpoint "create compose" que acepta JSON con stackFileContent (evita multipart).
+- name: Crear stack desde contenido de compose
+  ansible.builtin.uri:
+    url: "{{ portainer_url }}/api/stacks/create/compose?type=2&endpointId={{ _endpoint_id }}"
     method: POST
     headers:
       X-API-Key: "{{ portainer_api_token }}"
@@ -58,34 +109,11 @@
     validate_certs: "{{ portainer_validate_certs }}"
     body_format: json
     body:
-      Name: "{{ st.name }}"
-      RepositoryURL: "{{ st.repo_url }}"
-      RepositoryReferenceName: "{{ st.git_ref | default('main') }}"
-      ComposeFilePathInRepository: "{{ st.compose_path }}"
-      RepositoryAuthentication: false
-      Env: "{{ st.env | default([]) }}"
+      name: "{{ st.name }}"
+      stackFileContent: "{{ _compose_content }}"
+      prune: true
+      pullImage: true
+      env: "{{ st.env | default([]) }}"
     status_code: [200, 201]
   register: _create_resp
-  when: not _exists
-  changed_when: true
-
-# 3) Actualizar si existe: PUT /api/stacks/{id}?endpointId=...
-- name: Actualizar stack (si EXISTE)
-  ansible.builtin.uri:
-    url: "{{ portainer_url }}/api/stacks/{{ _existing_stack.Id }}?endpointId={{ _endpoint_id }}"
-    method: PUT
-    headers:
-      X-API-Key: "{{ portainer_api_token }}"
-      Content-Type: "application/json"
-    validate_certs: "{{ portainer_validate_certs }}"
-    body_format: json
-    body:
-      Prune: true
-      PullImage: true
-      RepositoryAuthentication: false
-      RepositoryReferenceName: "{{ st.git_ref | default('main') }}"
-      Env: "{{ st.env | default([]) }}"
-    status_code: 200
-  register: _update_resp
-  when: _exists
   changed_when: true

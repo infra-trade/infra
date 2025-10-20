@@ -1,10 +1,8 @@
-# inventories/group_vars/all.yml
 portainer_url: "https://10.20.0.12:9443"
+portainer_token: ""   # opcional si usas PORTAINER_TOKEN en el entorno
+portainer_validate_certs: false
 
-# CE 2.33.2 usa X-API-Key (no JWT). Puedes guardar la API key aquí o pasarla por env/-e.
-portainer_token: "{{ lookup('env','PORTAINER_TOKEN') | default('', true) }}"
-
-# Mapa lógico -> endpointId (ajústalos a tus IDs reales)
+# Mapea tus endpoints reales
 endpoints:
   mon: 2
   airflow: 3
@@ -12,39 +10,38 @@ endpoints:
   spark: 5
   db: 6
 
-# Stacks que quieres crear/actualizar desde Git
+# Ruta a tu clave si usas SSH para repo privado (opcional)
+github_deploy_key: "/home/ansible/.ssh/id_ed25519"
+
+# Stacks a gestionar
 stacks:
   - name: mon
     endpoint: mon
-    repo_url: "https://github.com/infra-trade/infra.git"
+    repo_url: "git@github.com:infra-trade/infra.git"   # <-- mejor SSH para privado
     compose_path: "mon/compose/docker-compose.yml"
     git_ref: "main"
     env: []
-
   - name: airflow
     endpoint: airflow
-    repo_url: "https://github.com/infra-trade/infra.git"
+    repo_url: "git@github.com:infra-trade/infra.git"
     compose_path: "airflow/compose/docker-compose.yml"
     git_ref: "main"
     env: []
-
   - name: kafka
     endpoint: kafka
-    repo_url: "https://github.com/infra-trade/infra.git"
+    repo_url: "git@github.com:infra-trade/infra.git"
     compose_path: "kafka/compose/docker-compose.yml"
     git_ref: "main"
     env: []
-
   - name: spark
     endpoint: spark
-    repo_url: "https://github.com/infra-trade/infra.git"
+    repo_url: "git@github.com:infra-trade/infra.git"
     compose_path: "spark/compose/docker-compose.yml"
     git_ref: "main"
     env: []
-
   - name: db
     endpoint: db
-    repo_url: "https://github.com/infra-trade/infra.git"
+    repo_url: "git@github.com:infra-trade/infra.git"
     compose_path: "db/compose/docker-compose.yml"
     git_ref: "main"
     env: []

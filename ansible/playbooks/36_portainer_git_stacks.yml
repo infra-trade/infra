@@ -5,7 +5,7 @@
   gather_facts: false
 
   vars:
-    # Si tu cert es self-signed, deja en false
+    # Si tu cert es self-signed
     portainer_validate_certs: false
 
   pre_tasks:
@@ -25,7 +25,7 @@
           - stacks is defined
           - stacks | length > 0
           - endpoints is defined
-        fail_msg: "Faltan variables: portainer_url, stacks o endpoints. Revisa group_vars/all.yml."
+        fail_msg: "Faltan variables: portainer_url, stacks o endpoints. Revisa inventories/group_vars/all.yml."
         success_msg: "Variables básicas presentes."
 
     - name: Verificar conectividad con Portainer
