@@ -1,3 +1,5 @@
+sync_target_group: "all"
+
 portainer_url: "https://10.20.0.12:9443"
 portainer_token: ""   # opcional si usas PORTAINER_TOKEN en el entorno
 portainer_validate_certs: false
@@ -47,6 +49,10 @@ stacks:
     env: []
 
 
+# Si no tienes algunas carpetas en el repo, no pasa nada: se omiten.
+# Grupo/hosts destino (puedes sobreescribir con -e targets=host1,host2)
+sync_target_group: "all"
+
 # Ruta local del repo IaC en el controlador
 iac_root: "/home/ansible/IaC"
 
@@ -76,10 +82,6 @@ sync_map:
     dest_conf: "/srv/iac/spark/conf"
     uid: 1000
     gid: 1000
-
-# Si no tienes algunas carpetas en el repo, no pasa nada: se omiten.
-# Grupo/hosts destino (puedes sobreescribir con -e targets=host1,host2)
-sync_target_group: "all"
 
 # Usa synchronize (rsync). Si no hay rsync en el remoto, cae a 'copy'.
 prefer_rsync: true
