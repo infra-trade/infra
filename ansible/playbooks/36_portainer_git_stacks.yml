@@ -5,6 +5,7 @@
   gather_facts: false
 
   vars:
+    # Si tienes self-signed en Portainer:
     portainer_validate_certs: false
 
   pre_tasks:
@@ -14,17 +15,15 @@
 
     - name: Fallar si no hay token
       ansible.builtin.fail:
-        msg: "No hay token para Portainer. Exporta PORTAINER_TOKEN o define portainer_token."
-      when: portainer_api_token | length == 0
+        msg: "Falta PORTAINER_TOKEN o var portainer_token"
+      when: (portainer_api_token | length) == 0
 
     - name: Verificar que existan variables requeridas
       ansible.builtin.assert:
         that:
           - portainer_url is defined
-          - stacks is defined
-          - stacks | length > 0
           - endpoints is defined
-        fail_msg: "Faltan variables: portainer_url, stacks o endpoints. Revisa inventories/group_vars/all.yml."
+          - stacks is defined
         success_msg: "Variables básicas presentes."
 
     - name: Verificar conectividad con Portainer
@@ -34,7 +33,6 @@
         headers:
           X-API-Key: "{{ portainer_api_token }}"
         validate_certs: "{{ portainer_validate_certs }}"
-        return_content: true
         status_code: 200
       register: _status
 
