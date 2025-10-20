@@ -59,7 +59,7 @@
     method: GET
     headers:
       X-API-Key: "{{ portainer_api_token }}"
-    validate_certs: "{{ portainer_validate_certs }}"
+    validate_certs: "{{ portainer_validate_certs | default(false) }}"
     return_content: true
     status_code: 200
   register: _stacks_list
@@ -68,7 +68,7 @@
   ansible.builtin.set_fact:
     _matches: >-
       {{
-        _stacks_list.json
+        (_stacks_list.json | list)
         | selectattr('Name','equalto', st.name)
         | selectattr('EndpointId','equalto', (_endpoint_id | int))
         | list
@@ -76,8 +76,8 @@
 
 - name: Derivar flags de existencia y stack existente
   ansible.builtin.set_fact:
-    _exists: "{{ (_matches | length) > 0 }}"
-    _existing_stack: "{{ _matches[0] if ((_matches | length) > 0) else omit }}"
+    _exists: "{{ (_matches | length) | int > 0 }}"
+    _existing_stack: "{{ _matches[0] if ((_matches | length) | int > 0) else omit }}"
 
 - name: Debug match
   ansible.builtin.debug:
@@ -91,52 +91,29 @@
     method: DELETE
     headers:
       X-API-Key: "{{ portainer_api_token }}"
-    validate_certs: "{{ portainer_validate_certs }}"
+    validate_certs: "{{ portainer_validate_certs | default(false) }}"
     status_code: 204
   when: _exists
   register: _delete_resp
   changed_when: _exists
 
-# === 4) Crear stack (CE) con method=string ===
-# Intento 1: JSON (algunas CE lo aceptan)
+# === 4) Crear stack (CE) con method=string en JSON ===
 - name: Crear stack desde contenido de compose (JSON)
-  block:
-    - name: POST /api/stacks?type=2&method=string&endpointId={{ _endpoint_id }} (JSON)
-      ansible.builtin.uri:
-        url: "{{ portainer_url }}/api/stacks?type=2&method=string&endpointId={{ _endpoint_id }}"
-        method: POST
-        headers:
-          X-API-Key: "{{ portainer_api_token }}"
-          Content-Type: "application/json"
-        validate_certs: "{{ portainer_validate_certs }}"
-        body_format: json
-        body:
-          # Portainer CE suele aceptar minúsculas en JSON:
-          name: "{{ st.name }}"
-          stackFileContent: "{{ _compose_content }}"
-          env: "{{ st.env | default([]) }}"
-          prune: true
-          pullImage: true
-        status_code: [200, 201]
-      register: _create_json
-      changed_when: true
-  rescue:
-    # Intento 2: multipart (forma clásica y más compatible en CE)
-    - name: Crear stack desde contenido de compose (multipart fallback)
-      community.general.uri:
-        url: "{{ portainer_url }}/api/stacks?type=2&method=string&endpointId={{ _endpoint_id }}"
-        method: POST
-        headers:
-          X-API-Key: "{{ portainer_api_token }}"
-        validate_certs: "{{ portainer_validate_certs }}"
-        body_format: form-multipart
-        body:
-          Name: "{{ st.name }}"
-          StackFileContent: "{{ _compose_content }}"
-          Prune: "true"
-          PullImage: "true"
-          # Env debe ser JSON string si lo usas:
-          Env: "{{ (st.env | default([])) | to_json }}"
-        status_code: [200, 201]
-      register: _create_multipart
-      changed_when: true
+  ansible.builtin.uri:
+    url: "{{ portainer_url }}/api/stacks?type=2&method=string&endpointId={{ _endpoint_id }}"
+    method: POST
+    headers:
+      X-API-Key: "{{ portainer_api_token }}"
+      Content-Type: "application/json"
+    validate_certs: "{{ portainer_validate_certs | default(false) }}"
+    body_format: json
+    body:
+      name: "{{ st.name }}"
+      stackFileContent: "{{ _compose_content }}"
+      env: "{{ st.env | default([]) }}"
+      prune: true
+      pullImage: true
+    status_code: [200, 201]
+  register: _create_json
+  when: not _exists
+  changed_when: true
