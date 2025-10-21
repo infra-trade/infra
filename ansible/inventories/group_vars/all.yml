@@ -45,3 +45,41 @@ stacks:
     compose_path: "db/compose/docker-compose.yml"
     git_ref: "main"
     env: []
+
+
+# Si no tienes algunas carpetas en el repo, no pasa nada: se omiten.
+# Grupo/hosts destino (puedes sobreescribir con -e targets=host1,host2)
+sync_target_group: "all"
+
+# Ruta local del repo IaC en el controlador
+iac_root: "/home/ansible/IaC"
+
+# Dónde queremos los archivos en cada host Docker
+sync_map:
+  airflow:
+    src_dags:     "{{ iac_root }}/airflow/dags"
+    src_plugins:  "{{ iac_root }}/airflow/plugins"
+    dest_dags:    "/srv/iac/airflow/dags"
+    dest_plugins: "/srv/iac/airflow/plugins"
+    # UID/GID típico de Airflow oficial (ajusta si tu imagen usa otros)
+    uid: 50000
+    gid: 50000
+
+  kafka:
+    src_config:  "{{ iac_root }}/kafka/config"
+    src_scripts: "{{ iac_root }}/kafka/scripts"
+    dest_config: "/srv/iac/kafka/config"
+    dest_scripts: "/srv/iac/kafka/scripts"
+    uid: 1000
+    gid: 1000
+
+  spark:
+    src_jobs: "{{ iac_root }}/spark/jobs"
+    src_conf: "{{ iac_root }}/spark/conf"
+    dest_jobs: "/srv/iac/spark/jobs"
+    dest_conf: "/srv/iac/spark/conf"
+    uid: 1000
+    gid: 1000
+
+# Usa synchronize (rsync). Si no hay rsync en el remoto, cae a 'copy'.
+prefer_rsync: true
