@@ -1,5 +1,3 @@
-sync_target_group: "all"
-
 portainer_url: "https://10.20.0.12:9443"
 portainer_token: ""   # opcional si usas PORTAINER_TOKEN en el entorno
 portainer_validate_certs: false
@@ -71,7 +69,7 @@ sync_map:
     src_config:  "{{ iac_root }}/kafka/config"
     src_scripts: "{{ iac_root }}/kafka/scripts"
     dest_config: "/srv/iac/kafka/config"
-    dest_scripts:"/srv/iac/kafka/scripts"
+    dest_scripts: "/srv/iac/kafka/scripts"
     uid: 1000
     gid: 1000
 
