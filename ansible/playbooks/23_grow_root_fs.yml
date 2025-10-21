@@ -1,0 +1,44 @@
+---
+- name: Extender partición y FS raíz
+  hosts: [airflow-core, kafka-core, spark-core, db-core, mon-core]
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Instalar utilidades (growpart)
+      ansible.builtin.package:
+        name: cloud-guest-utils
+        state: present
+
+    - name: Detectar dispositivo raíz
+      ansible.builtin.set_fact:
+        _root_device: "{{ ansible_mounts | selectattr('mount','equalto','/') | map(attribute='device') | first }}"
+
+    - name: Mostrar root device (debug)
+      ansible.builtin.debug:
+        var: _root_device
+
+    # Casos comunes: /dev/sda1 (virtio-scsi), /dev/vda1 (virtio-blk)
+    - name: Extraer disco y partición (e.g. /dev/sda + 1)
+      ansible.builtin.set_fact:
+        _root_disk: "{{ _root_device | regex_replace('([0-9]+)$','') }}"
+        _root_partnum: "{{ (_root_device | regex_search('([0-9]+)$')) }}"
+
+    - name: growpart a la partición raíz
+      ansible.builtin.command: "growpart {{ _root_disk }} {{ _root_partnum }}"
+      register: _growpart
+      changed_when: "'CHANGED' in _growpart.stdout or _growpart.rc == 0"
+      failed_when: _growpart.rc not in [0,1]  # 1 suele significar 'no growth needed'
+
+    - name: Detectar FS del raíz (ext4/xfs)
+      ansible.builtin.command: "findmnt -no FSTYPE /"
+      register: _fst
+      changed_when: false
+
+    - name: Extender EXT4
+      ansible.builtin.command: "resize2fs {{ _root_device }}"
+      when: _fst.stdout.strip() == "ext4"
+
+    - name: Extender XFS
+      ansible.builtin.command: "xfs_growfs /"
+      when: _fst.stdout.strip() == "xfs"

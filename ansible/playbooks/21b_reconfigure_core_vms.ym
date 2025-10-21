@@ -1,0 +1,81 @@
+---
+- name: Reconfigurar recursos de VMs existentes en Proxmox
+  hosts: pve
+  become: true
+  gather_facts: false
+
+  vars:
+    vms:
+      airflow-core: { vmid: 9301, cpu: 12, mem: 32768, disk_gb: 120, data_disk_gb: 100 }
+      kafka-core:   { vmid: 9302, cpu: 6,  mem: 24576, disk_gb: 160, data_disk_gb: 300 }
+      spark-core:   { vmid: 9303, cpu: 12, mem: 32768, disk_gb: 160, data_disk_gb: 200 }
+      db-core:      { vmid: 9304, cpu: 6,  mem: 16384, disk_gb: 100, data_disk_gb: 400 }
+      mon-core:     { vmid: 9305, cpu: 4,  mem: 12288, disk_gb: 120, data_disk_gb: 200 }
+
+  tasks:
+    - name: Asegurar que la VM existe
+      ansible.builtin.command: "qm status {{ item.value.vmid }}"
+      register: _status
+      changed_when: false
+      failed_when: _status.rc not in [0]
+      loop: "{{ vms | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: Establecer vCPU y RAM (requiere apagado si tu host no soporta hotplug)
+      ansible.builtin.command: >
+        qm set {{ item.value.vmid }}
+        -cores {{ item.value.cpu }}
+        -memory {{ item.value.mem }}
+      register: _set_cpu_mem
+      changed_when: "'update VM ' in _set_cpu_mem.stdout or _set_cpu_mem.rc == 0"
+      loop: "{{ vms | dict2items }}"
+      loop_control: { label: "{{ item.key }}" }
+
+    # --- Resize del disco del SO (scsi0) ---
+    # Si actualmente tienes ~43G y quieres 160G, usamos tamaño absoluto con '+'
+    - name: Obtener info de discos de la VM
+      ansible.builtin.command: "qm config {{ item.value.vmid }}"
+      register: _qm_cfg
+      changed_when: false
+      loop: "{{ vms | dict2items }}"
+      loop_control: { label: "{{ item.key }}" }
+
+    - name: Calcular tamaño actual del disco del SO (scsi0) en GiB
+      ansible.builtin.set_fact:
+        _scsi0_cur_gb: >-
+          {{
+            ( ( ( ( ( _qm_cfg.results[loop.index0].stdout | regex_search('scsi0:.*?,size=(\\d+)([MG])', '\\1') | first ) | int )
+               * ( ( _qm_cfg.results[loop.index0].stdout | regex_search('scsi0:.*?,size=(\\d+)([MG])', '\\2') | first ) == 'G' and 1 or 0 ) ) )
+             if ( _qm_cfg.results[loop.index0].stdout is search('scsi0:') ) else 0 )
+          }}
+      loop: "{{ vms | dict2items }}"
+      loop_control: { label: "{{ item.key }}" }
+
+    - name: Ampliar scsi0 si es necesario (solo crecer; no se puede reducir)
+      ansible.builtin.command: >
+        qm resize {{ item.value.vmid }} scsi0 {{ item.value.disk_gb }}G
+      when: item.value.disk_gb | int > _scsi0_cur_gb | default(0)
+      loop: "{{ vms | dict2items }}"
+      loop_control: { label: "{{ item.key }}" }
+
+    # Si deseas verificar/crear el data disk (scsi1) con tamaño absoluto:
+    - name: Asegurar scsi1 existe con el tamaño deseado (crea si falta, amplía si es menor)
+      ansible.builtin.shell: |
+        set -e
+        if qm config {{ item.value.vmid }} | grep -q '^scsi1:'; then
+          cur=$(qm config {{ item.value.vmid }} | sed -n 's/.*scsi1:.*size=\([0-9]\+\)\([MG]\).*/\1\2/p')
+          # Si está en G, comparamos
+          if echo "$cur" | grep -q 'G$'; then
+            cur_g=${cur%G}
+            if [ "$cur_g" -lt "{{ item.value.data_disk_gb | int }}" ]; then
+              qm resize {{ item.value.vmid }} scsi1 {{ item.value.data_disk_gb }}G
+            fi
+          fi
+        else
+          qm set {{ item.value.vmid }} -scsi1 local-lvm:{{ item.value.data_disk_gb }},ssd=1,discard=on,iothread=1
+        fi
+      args:
+        executable: /bin/bash
+      loop: "{{ vms | dict2items }}"
+      loop_control: { label: "{{ item.key }}" }
