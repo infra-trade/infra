@@ -1,6 +1,6 @@
 ---
 - name: Reconfigurar recursos de VMs existentes en Proxmox
-  hosts: pve
+  hosts: pve1
   become: true
   gather_facts: false
 
