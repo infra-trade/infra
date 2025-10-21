@@ -1,0 +1,49 @@
+---
+- name: Preparar rutas /srv/iac/* y permisos por stack
+  hosts: [airflow-core, kafka-core, spark-core, db-core]
+  become: true
+  gather_facts: false
+
+  vars:
+    dirs:
+      airflow:
+        paths:
+          - /srv/iac/airflow/dags
+          - /srv/iac/airflow/plugins
+          - /srv/iac/airflow/logs
+          - /srv/iac/airflow/redis
+        owner: 50000
+        group: 50000
+      kafka:
+        paths:
+          - /srv/iac/kafka/data
+          - /srv/iac/kafka/config
+          - /srv/iac/kafka/scripts
+        owner: 1000
+        group: 1000
+      spark:
+        paths:
+          - /srv/iac/spark/jobs
+          - /srv/iac/spark/conf
+        owner: 1000
+        group: 1000
+      db:
+        paths:
+          - /srv/iac/db/data
+          - /srv/iac/db/init
+          - /srv/iac/db/pgadmin
+          - /srv/iac/db/airflow     # si necesitas dumps, etc
+        owner: 999
+        group: 999
+
+  tasks:
+    - name: Crear directorios
+      ansible.builtin.file:
+        path: "{{ item.1 }}"
+        state: directory
+        owner: "{{ dirs[item.0].owner }}"
+        group: "{{ dirs[item.0].group }}"
+        mode: "0775"
+      loop: "{{ dirs | dict2items | subelements('value.paths') }}"
+      loop_control:
+        label: "{{ item.1 }}"
