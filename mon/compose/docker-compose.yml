@@ -1,5 +1,19 @@
+version: "3.8"
+
 services:
-  tu_servicio:
-    image: ...
-    environment:
-      - CANARY_VERSION=1.0.1   # <-- súbelo de 1.0.0 a 1.0.1
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    container_name: mon-prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"
+    ports:
+      - "9090:9090"
+    volumes:
+      # Config desde host (la subimos con el playbook de sync)
+      - /srv/iac/mon/prometheus/conf:/etc/prometheus:ro
+      # Datos en NFS (montado en el host mon-core pero vive en db-core)
+      - /srv/iac/mon/prometheus/data:/prometheus
+    restart: unless-stopped

@@ -276,3 +276,40 @@
 
     - ansible.builtin.debug:
         var: listout.stdout_lines
+
+- name: Sync de artefactos (configs Prometheus, DAGs, etc.)
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    prefer_rsync: true
+  tasks:
+    - name: Crear destino conf Prometheus (si existe sync_map.mon)
+      when: hostvars[inventory_hostname].inventory_hostname == "mon-core" and (sync_map.mon is defined)
+      file:
+        path: "{{ sync_map.mon.dest_prom_conf }}"
+        state: directory
+        owner: "{{ sync_map.mon.uid | default(0) }}"
+        group: "{{ sync_map.mon.gid | default(0) }}"
+        mode: "0755"
+
+    - name: Sincronizar conf Prometheus (rsync si disponible)
+      when: hostvars[inventory_hostname].inventory_hostname == "mon-core" and (sync_map.mon is defined)
+      block:
+        - name: Con rsync
+          synchronize:
+            src: "{{ sync_map.mon.src_prom_conf }}/"
+            dest: "{{ sync_map.mon.dest_prom_conf }}/"
+            rsync_opts:
+              - "--delete"
+          delegate_to: localhost
+          when: prefer_rsync | bool
+
+        - name: Sin rsync (fallback)
+          copy:
+            src: "{{ sync_map.mon.src_prom_conf }}/"
+            dest: "{{ sync_map.mon.dest_prom_conf }}/"
+            owner: "{{ sync_map.mon.uid | default(0) }}"
+            group: "{{ sync_map.mon.gid | default(0) }}"
+            mode: "0644"
+          when: not prefer_rsync | bool

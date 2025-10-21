@@ -1,0 +1,19 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Prometheus se auto-scrapea
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Ejemplos para tus VMs (ajusta nombres/ips si es necesario y si tienes node_exporter)
+  - job_name: 'nodes'
+    static_configs:
+      - targets:
+          - 'airflow-core:9100'
+          - 'kafka-core:9100'
+          - 'spark-core:9100'
+          - 'db-core:9100'
+          - 'mon-core:9100'

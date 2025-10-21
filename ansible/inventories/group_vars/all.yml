@@ -83,3 +83,10 @@ sync_map:
 
 # Usa synchronize (rsync). Si no hay rsync en el remoto, cae a 'copy'.
 prefer_rsync: true
+
+  mon:
+    src_prom_conf: "{{ iac_root }}/mon/prometheus"     # carpeta en el repo con prometheus.yml
+    dest_prom_conf: "/srv/iac/mon/prometheus/conf"     # donde el contenedor lo leerá
+    uid: 0
+    gid: 0
+
