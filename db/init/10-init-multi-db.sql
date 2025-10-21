@@ -1,0 +1,37 @@
+-- Airflow
+DO
+$do$
+BEGIN
+   IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = :'AIRFLOW_USER') THEN
+      EXECUTE format('CREATE ROLE %I LOGIN PASSWORD %L', :'AIRFLOW_USER', :'AIRFLOW_PASS');
+   END IF;
+END
+$do$;
+
+DO
+$do$
+BEGIN
+   IF NOT EXISTS (SELECT FROM pg_database WHERE datname = :'AIRFLOW_DB') THEN
+      EXECUTE format('CREATE DATABASE %I OWNER %I', :'AIRFLOW_DB', :'AIRFLOW_USER');
+   END IF;
+END
+$do$;
+
+-- Trading
+DO
+$do$
+BEGIN
+   IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = :'TRADING_USER') THEN
+      EXECUTE format('CREATE ROLE %I LOGIN PASSWORD %L', :'TRADING_USER', :'TRADING_PASS');
+   END IF;
+END
+$do$;
+
+DO
+$do$
+BEGIN
+   IF NOT EXISTS (SELECT FROM pg_database WHERE datname = :'TRADING_DB') THEN
+      EXECUTE format('CREATE DATABASE %I OWNER %I', :'TRADING_DB', :'TRADING_USER');
+   END IF;
+END
+$do$;
