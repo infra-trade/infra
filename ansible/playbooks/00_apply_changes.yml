@@ -1,0 +1,27 @@
+---
+- name: Pull repo + aplicar cambios (stacks y artefactos)
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    iac_root: "/home/ansible/IaC"
+    repo_url: "git@github.com:infra-trade/infra.git"
+    git_ref: "main"
+    github_deploy_key: "/home/ansible/.ssh/id_ed25519"
+
+  tasks:
+    - name: Asegurar checkout actualizado del repo IaC
+      ansible.builtin.git:
+        repo: "{{ repo_url }}"
+        dest: "{{ iac_root }}"
+        version: "{{ git_ref }}"
+        accept_hostkey: true
+        key_file: "{{ github_deploy_key }}"
+        update: true
+        force: true
+
+- name: Aplicar stacks Portainer (play 36)
+  import_playbook: "36_portainer_git_stacks.yml"
+
+- name: Sincronizar artefactos (play 98/99)
+  import_playbook: "98_sync_artifacts.yml"
