@@ -14,6 +14,7 @@
           - /srv/iac/airflow/redis
         owner: 50000
         group: 50000
+
       kafka:
         paths:
           - /srv/iac/kafka/data
@@ -21,18 +22,20 @@
           - /srv/iac/kafka/scripts
         owner: 1000
         group: 1000
+
       spark:
         paths:
           - /srv/iac/spark/jobs
           - /srv/iac/spark/conf
         owner: 1000
         group: 1000
+
       db:
         paths:
           - /srv/iac/db/data
           - /srv/iac/db/init
           - /srv/iac/db/pgadmin
-          - /srv/iac/db/airflow     # si necesitas dumps, etc
+          - /srv/iac/db/airflow
         owner: 999
         group: 999
 
@@ -41,8 +44,8 @@
       ansible.builtin.file:
         path: "{{ item.1 }}"
         state: directory
-        owner: "{{ dirs[item.0].owner }}"
-        group: "{{ dirs[item.0].group }}"
+        owner: "{{ item.0.value.owner }}"
+        group: "{{ item.0.value.group }}"
         mode: "0775"
       loop: "{{ dirs | dict2items | subelements('value.paths') }}"
       loop_control:
