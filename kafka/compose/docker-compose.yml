@@ -1,4 +1,4 @@
 # ejemplo genérico (ajústalo por VM)
 services:
   hello:
-    image: hello-world
+    image: hello-world1

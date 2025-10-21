@@ -76,8 +76,8 @@
 
 - name: Derivar flags de existencia y stack existente
   ansible.builtin.set_fact:
-    _exists: "{{ (_matches | length) | int > 0 }}"
-    _existing_stack: "{{ _matches[0] if (((_matches | length) | int) > 0) else omit }}"
+    _exists: "{{ (_matches | length) > 0 }}"
+    _existing_stack: "{{ _matches[0] if ((_matches | length) > 0) else omit }}"
 
 - name: Debug match
   ansible.builtin.debug:
@@ -97,23 +97,46 @@
   register: _delete_resp
   changed_when: _exists
 
-# === 4) Crear stack (CE) con método más compatible: MULTIPART a /create/compose ===
-- name: Crear stack desde contenido de compose (multipart CE)
-  ansible.builtin.uri:
-    url: "{{ portainer_url }}/api/stacks/create/compose?type=2&endpointId={{ _endpoint_id }}"
-    method: POST
-    headers:
-      X-API-Key: "{{ portainer_api_token }}"
-    validate_certs: "{{ portainer_validate_certs }}"
-    body_format: form-multipart
-    body:
-      # Portainer espera estas claves en mayúscula en multipart:
-      Name: "{{ st.name }}"
-      StackFileContent: "{{ _compose_content }}"
-      # Env como string JSON:
-      Env: "{{ (st.env | default([])) | to_json }}"
-      Prune: "true"
-      PullImage: "true"
-    status_code: [200, 201]
-  register: _create_multipart
-  changed_when: true
+# === 4) Crear stack (CE) con method=standalone/string ===
+# Intento 1: JSON (deja que Ansible serialice y escape)
+- name: Crear stack desde contenido de compose (JSON)
+  block:
+    - name: POST /api/stacks/create/standalone/string?endpointId={{ _endpoint_id }} (JSON)
+      ansible.builtin.uri:
+        url: "{{ portainer_url }}/api/stacks/create/standalone/string?endpointId={{ _endpoint_id }}"
+        method: POST
+        headers:
+          X-API-Key: "{{ portainer_api_token }}"
+          Content-Type: "application/json"
+        validate_certs: "{{ portainer_validate_certs }}"
+        body_format: json
+        body:
+          name: "{{ st.name }}"
+          stackFileContent: "{{ _compose_content }}"
+          env: "{{ st.env | default([]) }}"
+          prune: true
+          pullImage: true
+        status_code: [200, 201]
+      register: _create_json
+      changed_when: true
+  rescue:
+    # Intento 2: x-www-form-urlencoded (fallback)
+    - name: Crear stack desde contenido de compose (form-urlencoded fallback)
+      ansible.builtin.uri:
+        url: "{{ portainer_url }}/api/stacks/create/standalone/string?endpointId={{ _endpoint_id }}"
+        method: POST
+        headers:
+          X-API-Key: "{{ portainer_api_token }}"
+          Content-Type: "application/x-www-form-urlencoded"
+        validate_certs: "{{ portainer_validate_certs }}"
+        body_format: form-urlencoded
+        body:
+          Name: "{{ st.name }}"
+          StackFileContent: "{{ _compose_content }}"
+          # Env debe viajar como JSON string:
+          Env: "{{ (st.env | default([])) | to_json }}"
+          Prune: "true"
+          PullImage: "true"
+        status_code: [200, 201]
+      register: _create_form
+      changed_when: true

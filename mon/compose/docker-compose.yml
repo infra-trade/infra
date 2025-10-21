@@ -1,4 +1,5 @@
-# ejemplo genérico (ajústalo por VM)
 services:
-  hello:
-    image: hello-world
+  tu_servicio:
+    image: ...
+    environment:
+      - CANARY_VERSION=1.0.1   # <-- súbelo de 1.0.0 a 1.0.1
