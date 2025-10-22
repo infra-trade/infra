@@ -54,10 +54,19 @@
     _compose_content: "{{ _compose_b64.content | b64decode }}"
 
 # === 2) Cargar .env (si existe) y SANEAR compose (quitar cualquier env_file) ===
-- name: Determinar rutas .env y dir del compose
+
+# Paso 2.0: construir rutas sin referenciar variables nuevas en la misma tarea
+- name: Construir ruta absoluta del compose
   ansible.builtin.set_fact:
-    _compose_dir: "{{ ('/tmp/portainer_repos/' ~ st.name ~ '/' ~ st.compose_path) | dirname }}"
-    _env_file_path: "{{ _compose_dir ~ '/.env' }}"
+    _compose_abs: "/tmp/portainer_repos/{{ st.name }}/{{ st.compose_path }}"
+
+- name: Calcular directorio del compose
+  ansible.builtin.set_fact:
+    _compose_dir: "{{ _compose_abs | dirname }}"
+
+- name: Calcular ruta del .env junto al compose
+  ansible.builtin.set_fact:
+    _env_file_path: "{{ _compose_dir }}/.env"
 
 - name: Verificar si existe .env
   ansible.builtin.stat:
@@ -108,12 +117,6 @@
   ansible.builtin.set_fact:
     _compose_final: "{{ (_compose_step3 | default(_compose_content))
                        | regex_replace('(?m)^\\s*-\\s*\\.?/?\\.env\\s*$', '') }}"
-
-# (Opcional) Debug del compose saneado para un stack concreto
-# - name: Debug compose saneado
-#   ansible.builtin.debug:
-#     var: _compose_final
-#   when: st.name == 'airflow'
 
 # === 3) Descubrir si el stack existe ===
 - name: Listar stacks existentes (Portainer)
