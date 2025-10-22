@@ -3,6 +3,7 @@
 # Requiere vars del play: portainer_url, portainer_api_token, endpoints (mapa), portainer_validate_certs
 # Opcional (repo privado por SSH): github_deploy_key (ruta a la key)
 
+# === 0) Resolver endpointId ===
 - name: Resolver endpointId para {{ st.name }}
   ansible.builtin.set_fact:
     _endpoint_id: "{{ (endpoints[st.endpoint] | default(omit)) | int }}"
@@ -52,14 +53,76 @@
   ansible.builtin.set_fact:
     _compose_content: "{{ _compose_b64.content | b64decode }}"
 
-# === 2) Descubrir si el stack existe ===
+# === 2) Cargar .env (si existe) y SANEAR compose (quitar cualquier env_file) ===
+- name: Determinar rutas .env y dir del compose
+  ansible.builtin.set_fact:
+    _compose_dir: "{{ ('/tmp/portainer_repos/' ~ st.name ~ '/' ~ st.compose_path) | dirname }}"
+    _env_file_path: "{{ _compose_dir ~ '/.env' }}"
+
+- name: Verificar si existe .env
+  ansible.builtin.stat:
+    path: "{{ _env_file_path }}"
+  register: _env_stat
+  delegate_to: localhost
+  run_once: true
+
+- name: Leer .env si existe
+  ansible.builtin.slurp:
+    path: "{{ _env_file_path }}"
+  when: _env_stat.stat.exists
+  register: _env_b64
+  delegate_to: localhost
+  run_once: true
+
+- name: Parsear .env a lista Env (name/value)
+  ansible.builtin.set_fact:
+    _env_list: >-
+      {{
+        (_env_b64.content | default('') | b64decode).splitlines()
+        | select('match','^[A-Za-z_][A-Za-z0-9_]*=.*$')
+        | map('regex_replace','^([A-Za-z_][A-Za-z0-9_]*)=(.*)$','{"name":"\\1","value":"\\2"}')
+        | map('from_json')
+        | list
+      }}
+  when: _env_stat.stat.exists
+
+# Saneo agresivo de cualquier env_file (línea simple, lista en corchetes, o bloque multilínea)
+- name: Remover "env_file: .env" (línea simple)
+  ansible.builtin.set_fact:
+    _compose_step1: "{{ _compose_content | regex_replace('(?m)^\\s*env_file\\s*:\\s*\\.?/?\\.env\\s*$', '') }}"
+
+- name: Remover "env_file: [ ... ]" (forma con corchetes)
+  ansible.builtin.set_fact:
+    _compose_step2: "{{ (_compose_step1 | default(_compose_content))
+                       | regex_replace('(?mi)^\\s*env_file\\s*:\\s*\\[[^\\]]*\\]\\s*$', '') }}"
+
+- name: Remover bloque env_file con lista (- .env)
+  ansible.builtin.set_fact:
+    _compose_step3: >-
+      {{
+        (_compose_step2 | default(_compose_content))
+        | regex_replace('(?ms)^\\s*env_file\\s*:\\s*\\n(?:\\s*-\\s*\\.?/?\\.env\\s*\\n)+', '')
+      }}
+
+- name: Remover líneas sueltas "- .env"
+  ansible.builtin.set_fact:
+    _compose_final: "{{ (_compose_step3 | default(_compose_content))
+                       | regex_replace('(?m)^\\s*-\\s*\\.?/?\\.env\\s*$', '') }}"
+
+# (Opcional) Debug del compose saneado para un stack concreto
+# - name: Debug compose saneado
+#   ansible.builtin.debug:
+#     var: _compose_final
+#   when: st.name == 'airflow'
+
+# === 3) Descubrir si el stack existe ===
 - name: Listar stacks existentes (Portainer)
   ansible.builtin.uri:
     url: "{{ portainer_url }}/api/stacks"
     method: GET
     headers:
       X-API-Key: "{{ portainer_api_token }}"
-    validate_certs: "{{ portainer_validate_certs }}"
+    validate_certs: "{{ portainer_validate_certs | default(false) }}"
     return_content: true
     status_code: 200
   register: _stacks_list
@@ -76,51 +139,48 @@
 
 - name: Derivar flags de existencia y stack existente
   ansible.builtin.set_fact:
-    _exists: "{{ (_matches | length) > 0 }}"
-    _existing_stack: "{{ _matches[0] if ((_matches | length) > 0) else omit }}"
+    _exists: "{{ (_matches | length) | int > 0 }}"
+    _existing_stack: "{{ _matches[0] if ((_matches | length) | int > 0) else omit }}"
 
 - name: Debug match
   ansible.builtin.debug:
     msg:
       - "Stack '{{ st.name }}' en endpoint {{ _endpoint_id }} => {{ 'EXISTE' if _exists else 'NO EXISTE' }}"
 
-# === 3) Si existe: borrar (recreamos con compose string) ===
+# === 4) Si existe: borrar (vamos a recrear con compose string) ===
 - name: Borrar stack existente (si aplica)
   ansible.builtin.uri:
     url: "{{ portainer_url }}/api/stacks/{{ _existing_stack.Id }}?endpointId={{ _endpoint_id }}"
     method: DELETE
     headers:
       X-API-Key: "{{ portainer_api_token }}"
-    validate_certs: "{{ portainer_validate_certs }}"
+    validate_certs: "{{ portainer_validate_certs | default(false) }}"
     status_code: 204
   when: _exists
   register: _delete_resp
   changed_when: _exists
 
-# === 4) Crear stack (CE) con method=standalone/string ===
-# Intento 1: JSON (deja que Ansible serialice y escape)
-- name: Crear stack desde contenido de compose (JSON)
+# === 5) Crear stack (CE) con method=string (JSON) + fallback form-urlencoded ===
+- name: POST /api/stacks/create/standalone/string?endpointId={{ _endpoint_id }} (JSON)
   block:
-    - name: POST /api/stacks/create/standalone/string?endpointId={{ _endpoint_id }} (JSON)
-      ansible.builtin.uri:
+    - ansible.builtin.uri:
         url: "{{ portainer_url }}/api/stacks/create/standalone/string?endpointId={{ _endpoint_id }}"
         method: POST
         headers:
           X-API-Key: "{{ portainer_api_token }}"
           Content-Type: "application/json"
-        validate_certs: "{{ portainer_validate_certs }}"
+        validate_certs: "{{ portainer_validate_certs | default(false) }}"
         body_format: json
         body:
           name: "{{ st.name }}"
-          stackFileContent: "{{ _compose_content }}"
-          env: "{{ st.env | default([]) }}"
+          stackFileContent: "{{ _compose_final | default(_compose_content) }}"
+          env: "{{ (st.env | default([])) + (_env_list | default([])) }}"
           prune: true
           pullImage: true
         status_code: [200, 201]
       register: _create_json
       changed_when: true
   rescue:
-    # Intento 2: x-www-form-urlencoded (fallback)
     - name: Crear stack desde contenido de compose (form-urlencoded fallback)
       ansible.builtin.uri:
         url: "{{ portainer_url }}/api/stacks/create/standalone/string?endpointId={{ _endpoint_id }}"
@@ -128,15 +188,15 @@
         headers:
           X-API-Key: "{{ portainer_api_token }}"
           Content-Type: "application/x-www-form-urlencoded"
-        validate_certs: "{{ portainer_validate_certs }}"
-        body_format: form-urlencoded
-        body:
-          Name: "{{ st.name }}"
-          StackFileContent: "{{ _compose_content }}"
-          # Env debe viajar como JSON string:
-          Env: "{{ (st.env | default([])) | to_json }}"
-          Prune: "true"
-          PullImage: "true"
+        validate_certs: "{{ portainer_validate_certs | default(false) }}"
+        body: >-
+          {{ {
+            'Name': st.name,
+            'StackFileContent': (_compose_final | default(_compose_content)),
+            'Prune': 'true',
+            'PullImage': 'true',
+            'Env': ((st.env | default([])) + (_env_list | default([]))) | to_json
+          } | urlencode }}
         status_code: [200, 201]
       register: _create_form
       changed_when: true

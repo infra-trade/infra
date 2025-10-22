@@ -1,22 +1,29 @@
 ---
+# Despliega/actualiza stacks en Portainer CE 2.33.2 usando contenido del compose (method=string)
+# Requiere en group_vars/all.yml:
+#   portainer_url, portainer_token (o export PORTAINER_TOKEN), portainer_validate_certs
+#   endpoints: { mon: 2, airflow: 3, ... }
+#   stacks: [ {name, endpoint, repo_url, compose_path, git_ref, env[]} ]
+# Opcional: github_deploy_key para repos privados por SSH
+
 - name: Create/Update Portainer stacks from Git (CE 2.33.2)
   hosts: mon-core
-  become: true
   gather_facts: false
 
   vars:
-    # Si tienes self-signed en Portainer:
-    portainer_validate_certs: false
+    # 1) Token por entorno tiene prioridad; si no, usa var portainer_token
+    portainer_api_token: "{{ lookup('env','PORTAINER_TOKEN') | default(portainer_token | default(''), true) }}"
 
   pre_tasks:
     - name: Resolver token (env primero, si no existe usa var portainer_token)
       ansible.builtin.set_fact:
-        portainer_api_token: "{{ lookup('env','PORTAINER_TOKEN') | default(portainer_token | default('', true), true) }}"
+        portainer_api_token: "{{ portainer_api_token }}"
 
     - name: Fallar si no hay token
-      ansible.builtin.fail:
-        msg: "Falta PORTAINER_TOKEN o var portainer_token"
-      when: (portainer_api_token | length) == 0
+      ansible.builtin.assert:
+        that:
+          - portainer_api_token | length > 0
+        fail_msg: "No hay API key de Portainer. Exporta PORTAINER_TOKEN o define portainer_token en group_vars."
 
     - name: Verificar que existan variables requeridas
       ansible.builtin.assert:
@@ -24,6 +31,7 @@
           - portainer_url is defined
           - endpoints is defined
           - stacks is defined
+          - stacks | length > 0
         success_msg: "Variables básicas presentes."
 
     - name: Verificar conectividad con Portainer
@@ -32,7 +40,8 @@
         method: GET
         headers:
           X-API-Key: "{{ portainer_api_token }}"
-        validate_certs: "{{ portainer_validate_certs }}"
+        validate_certs: "{{ portainer_validate_certs | default(false) }}"
+        return_content: true
         status_code: 200
       register: _status
 
