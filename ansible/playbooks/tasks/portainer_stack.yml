@@ -54,6 +54,8 @@
     _compose_content: "{{ _compose_b64.content | b64decode }}"
 
 # === 2) Cargar .env (si existe) y SANEAR compose (quitar cualquier env_file) ===
+
+# Paso 2.0: construir rutas sin referenciar variables nuevas en la misma tarea
 - name: Construir ruta absoluta del compose
   ansible.builtin.set_fact:
     _compose_abs: "/tmp/portainer_repos/{{ st.name }}/{{ st.compose_path }}"
@@ -93,7 +95,7 @@
       }}
   when: _env_stat.stat.exists
 
-# Saneo de env_file
+# Saneo agresivo de cualquier env_file (línea simple, lista en corchetes, o bloque multilínea)
 - name: Remover env_file .env (línea simple)
   ansible.builtin.set_fact:
     _compose_step1: "{{ _compose_content | regex_replace('(?m)^\\s*env_file\\s*:\\s*\\.?/?\\.env\\s*$', '') }}"
@@ -123,12 +125,9 @@
     method: GET
     headers:
       X-API-Key: "{{ portainer_api_token }}"
-      Accept: "application/json"
     validate_certs: "{{ portainer_validate_certs | default(false) }}"
     return_content: true
     status_code: 200
-    timeout: "{{ portainer_api_timeout | default(60) }}"
-    follow_redirects: all
   register: _stacks_list
 
 - name: Calcular lista de coincidencias
@@ -151,32 +150,27 @@
     msg:
       - "Stack '{{ st.name }}' en endpoint {{ _endpoint_id }} => {{ 'EXISTE' if _exists else 'NO EXISTE' }}"
 
-# === 4) Si existe: borrar ===
+# === 4) Si existe: borrar (vamos a recrear con compose string) ===
 - name: Borrar stack existente (si aplica)
   ansible.builtin.uri:
     url: "{{ portainer_url }}/api/stacks/{{ _existing_stack.Id }}?endpointId={{ _endpoint_id }}"
     method: DELETE
     headers:
       X-API-Key: "{{ portainer_api_token }}"
-      Accept: "application/json"
     validate_certs: "{{ portainer_validate_certs | default(false) }}"
     status_code: 204
-    timeout: "{{ portainer_api_timeout | default(300) }}"
-    follow_redirects: all
   when: _exists
   register: _delete_resp
   changed_when: _exists
 
-# === 5) Crear stack (JSON) con timeout alto + retry; fallback form-urlencoded limpio ===
-- name: POST /api/stacks/create/standalone/string (JSON) con timeout alto
+# === 5) Crear stack (CE) con method=string (JSON) + fallback form-urlencoded ===
+- name: POST /api/stacks/create/standalone/string (JSON)
   block:
-    - name: Intento JSON
-      ansible.builtin.uri:
+    - ansible.builtin.uri:
         url: "{{ portainer_url }}/api/stacks/create/standalone/string?endpointId={{ _endpoint_id }}"
         method: POST
         headers:
           X-API-Key: "{{ portainer_api_token }}"
-          Accept: "application/json"
           Content-Type: "application/json"
         validate_certs: "{{ portainer_validate_certs | default(false) }}"
         body_format: json
@@ -187,31 +181,25 @@
           prune: true
           pullImage: true
         status_code: [200, 201]
-        timeout: "{{ portainer_api_timeout | default(300) }}"
-        follow_redirects: all
       register: _create_json
       changed_when: true
-      retries: 2
-      delay: 5
-      until: _create_json.status in [200, 201]
   rescue:
-    - name: Fallback form-urlencoded (deja que Ansible codifique el formulario)
+    - name: Crear stack desde contenido de compose (form-urlencoded fallback)
       ansible.builtin.uri:
         url: "{{ portainer_url }}/api/stacks/create/standalone/string?endpointId={{ _endpoint_id }}"
         method: POST
         headers:
           X-API-Key: "{{ portainer_api_token }}"
-          Accept: "application/json"
+          Content-Type: "application/x-www-form-urlencoded"
         validate_certs: "{{ portainer_validate_certs | default(false) }}"
-        body_format: form-urlencoded
-        body:
-          Name: "{{ st.name }}"
-          StackFileContent: "{{ _compose_final | default(_compose_content) }}"
-          Prune: "true"
-          PullImage: "true"
-          Env: "{{ ((st.env | default([])) + (_env_list | default([]))) | to_json }}"
+        body: >-
+          {{ {
+            'Name': st.name,
+            'StackFileContent': (_compose_final | default(_compose_content)),
+            'Prune': 'true',
+            'PullImage': 'true',
+            'Env': ((st.env | default([])) + (_env_list | default([]))) | to_json
+          } | urlencode }}
         status_code: [200, 201]
-        timeout: "{{ portainer_api_timeout | default(300) }}"
-        follow_redirects: all
       register: _create_form
       changed_when: true
