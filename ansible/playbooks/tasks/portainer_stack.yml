@@ -87,16 +87,16 @@
   when: _env_stat.stat.exists
 
 # Saneo agresivo de cualquier env_file (línea simple, lista en corchetes, o bloque multilínea)
-- name: Remover "env_file: .env" (línea simple)
+- name: Remover env_file .env (línea simple)
   ansible.builtin.set_fact:
     _compose_step1: "{{ _compose_content | regex_replace('(?m)^\\s*env_file\\s*:\\s*\\.?/?\\.env\\s*$', '') }}"
 
-- name: Remover "env_file: [ ... ]" (forma con corchetes)
+- name: Remover env_file con corchetes
   ansible.builtin.set_fact:
     _compose_step2: "{{ (_compose_step1 | default(_compose_content))
                        | regex_replace('(?mi)^\\s*env_file\\s*:\\s*\\[[^\\]]*\\]\\s*$', '') }}"
 
-- name: Remover bloque env_file con lista (- .env)
+- name: Remover bloque env_file con lista
   ansible.builtin.set_fact:
     _compose_step3: >-
       {{
@@ -104,7 +104,7 @@
         | regex_replace('(?ms)^\\s*env_file\\s*:\\s*\\n(?:\\s*-\\s*\\.?/?\\.env\\s*\\n)+', '')
       }}
 
-- name: Remover líneas sueltas "- .env"
+- name: Remover líneas sueltas de .env
   ansible.builtin.set_fact:
     _compose_final: "{{ (_compose_step3 | default(_compose_content))
                        | regex_replace('(?m)^\\s*-\\s*\\.?/?\\.env\\s*$', '') }}"
@@ -161,7 +161,7 @@
   changed_when: _exists
 
 # === 5) Crear stack (CE) con method=string (JSON) + fallback form-urlencoded ===
-- name: POST /api/stacks/create/standalone/string?endpointId={{ _endpoint_id }} (JSON)
+- name: POST /api/stacks/create/standalone/string (JSON)
   block:
     - ansible.builtin.uri:
         url: "{{ portainer_url }}/api/stacks/create/standalone/string?endpointId={{ _endpoint_id }}"
