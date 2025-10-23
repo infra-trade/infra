@@ -1,4 +1,15 @@
+# group_vars/all.yml
+portainer_url: "https://10.20.0.12:9443"
+portainer_validate_certs: false
+
 stacks:
+  - name: mon
+    endpoint: mon          # ← NOMBRE exacto del endpoint en Portainer
+    repo_url: "git@github.com:infra-trade/infra.git"
+    compose_path: "mon/compose/docker-compose.yml"
+    git_ref: "main"
+    env: []
+
   - name: airflow
     endpoint: airflow
     repo_url: "git@github.com:infra-trade/infra.git"
@@ -9,4 +20,3 @@ stacks:
       - { name: AIRFLOW__CORE__EXECUTOR, value: "LocalExecutor" }
       - { name: PUID, value: "50000" }
       - { name: PG_HOST, value: "db-core" }
-      # añade TODAS las ${VAR} que aparezcan en ese compose

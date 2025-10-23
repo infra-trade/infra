@@ -1,53 +1,94 @@
 ---
-# Despliega/actualiza stacks en Portainer CE 2.33.2 usando contenido del compose (method=string)
+# Despliega/actualiza stacks en Portainer CE 2.33.x resolviendo endpointId por NOMBRE o ID
 # Requiere en group_vars/all.yml:
 #   portainer_url, portainer_token (o export PORTAINER_TOKEN), portainer_validate_certs
-#   endpoints: { mon: 2, airflow: 3, ... }
 #   stacks: [ {name, endpoint, repo_url, compose_path, git_ref, env[]} ]
-# Opcional: github_deploy_key para repos privados por SSH
+#   (YA NO necesitas mantener un 'endpoints: {name:id}' fijo; se resuelve dinámicamente)
 
-- name: Create/Update Portainer stacks from Git (CE 2.33.2)
+- name: Create/Update Portainer stacks from Git (dynamic endpointId)
   hosts: mon-core
   gather_facts: false
 
   vars:
-    # 1) Token por entorno tiene prioridad; si no, usa var portainer_token
+    # 1) Token: variable de entorno tiene prioridad
     portainer_api_token: "{{ lookup('env','PORTAINER_TOKEN') | default(portainer_token | default(''), true) }}"
 
   pre_tasks:
-    - name: Resolver token (env primero, si no existe usa var portainer_token)
-      ansible.builtin.set_fact:
-        portainer_api_token: "{{ portainer_api_token }}"
-
-    - name: Fallar si no hay token
+    - name: Afirmar token presente
       ansible.builtin.assert:
         that:
           - portainer_api_token | length > 0
         fail_msg: "No hay API key de Portainer. Exporta PORTAINER_TOKEN o define portainer_token en group_vars."
 
-    - name: Verificar que existan variables requeridas
+    - name: Afirmar variables básicas
       ansible.builtin.assert:
         that:
           - portainer_url is defined
-          - endpoints is defined
           - stacks is defined
           - stacks | length > 0
         success_msg: "Variables básicas presentes."
 
-    - name: Verificar conectividad con Portainer
+    - name: Probar conectividad con Portainer
       ansible.builtin.uri:
         url: "{{ portainer_url }}/api/system/status"
         method: GET
-        headers:
-          X-API-Key: "{{ portainer_api_token }}"
+        headers: { X-API-Key: "{{ portainer_api_token }}" }
         validate_certs: "{{ portainer_validate_certs | default(false) }}"
         return_content: true
         status_code: 200
       register: _status
 
+    - name: Obtener lista de endpoints desde Portainer
+      ansible.builtin.uri:
+        url: "{{ portainer_url }}/api/endpoints?limit=1000"
+        method: GET
+        headers: { X-API-Key: "{{ portainer_api_token }}" }
+        validate_certs: "{{ portainer_validate_certs | default(false) }}"
+        return_content: true
+        status_code: 200
+      register: _endpoints
+
+    - name: Construir mapa nombre→Id y lista para debug
+      ansible.builtin.set_fact:
+        endpoints_map: "{{ dict(_endpoints.json | json_query('[].{k: Name, v: Id}') | map(attribute='k') | zip((_endpoints.json | json_query('[].{k: Name, v: Id}') | map(attribute='v')))) }}"
+        endpoints_list: "{{ _endpoints.json | json_query('[].{Id: Id, Name: Name, URL: URL, PublicURL: PublicURL, Type: Type}') }}"
+      # endpoints_map = {"mon":2, "airflow":3, ...} según la instalación REAL
+
+    - name: Mostrar endpoints detectados (útil para auditoría)
+      ansible.builtin.debug:
+        var: endpoints_list
+
   tasks:
-    - name: Crear/actualizar cada stack
+    - name: Resolver endpointId (por stack) y ejecutar tareas del stack
       ansible.builtin.include_tasks: "tasks/portainer_stack.yml"
+      vars:
+        # endpoint_id: si st.endpoint es numérico => úsalo; si es nombre => resuélvelo
+        endpoint_id: >-
+          {{
+            (st.endpoint | string) is match('^[0-9]+$')
+            | ternary(st.endpoint | int,
+                      (endpoints_map[st.endpoint]
+                        if st.endpoint in endpoints_map
+                        else
+                        (ansible_facts.undefined_var | default(omit)))
+                     )
+          }}
       loop: "{{ stacks }}"
       loop_control:
         loop_var: st
+      # Validación previa a incluir: si no resolvió, fallar con mensaje claro
+      when: >
+        ( (st.endpoint | string) is match('^[0-9]+$') )
+        or
+        ( st.endpoint in endpoints_map )
+    - name: Fallar si algún stack referencia un endpoint inexistente
+      ansible.builtin.fail:
+        msg: >-
+          El endpoint '{{ st.endpoint }}' no existe en Portainer. Endpoints disponibles:
+          {{ endpoints_list | map(attribute='Name') | list }}
+      loop: "{{ stacks }}"
+      loop_control:
+        loop_var: st
+      when: >
+        not ( (st.endpoint | string) is match('^[0-9]+$') )
+        and ( st.endpoint not in endpoints_map )

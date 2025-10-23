@@ -1,205 +1,225 @@
 ---
-# Requiere vars del item: st.name, st.endpoint, st.repo_url, st.compose_path, st.git_ref, st.env
-# Requiere vars del play: portainer_url, portainer_api_token, endpoints (mapa), portainer_validate_certs
-# Opcional (repo privado por SSH): github_deploy_key (ruta a la key)
+# Requiere variables externas:
+# - portainer_url (https://HOST:9443)
+# - portainer_api_token (API Key)
+# - portainer_validate_certs (bool)
+# - st: { name, endpoint, repo_url, compose_path, git_ref, env: [ {name,value}, ... ] }
+# - endpoint_id (int) → ya resuelto por el play que incluye esta tarea
 
-# === 0) Resolver endpointId ===
-- name: Resolver endpointId para {{ st.name }}
+# ====== Preparación del workspace local ======
+- name: Definir carpetas locales
   ansible.builtin.set_fact:
-    _endpoint_id: "{{ (endpoints[st.endpoint] | default(omit)) | int }}"
+    _git_base: "{{ lookup('env','HOME') ~ '/.cache/portainer-stacks' }}"
+    _repo_dir: "{{ lookup('env','HOME') ~ '/.cache/portainer-stacks/' ~ (st.repo_url | regex_replace('[^A-Za-z0-9_.-]','_')) ~ '_' ~ (st.git_ref | default('main')) }}"
+    _compose_rel: "{{ st.compose_path }}"
+    _compose_abs: "{{ _repo_dir ~ '/' ~ st.compose_path }}"
+    _compose_dir: "{{ (_repo_dir ~ '/' ~ st.compose_path) | dirname }}"
+    _dotenv_abs: "{{ (_repo_dir ~ '/' ~ st.compose_path) | dirname ~ '/.env' }}"
 
-- name: Validar endpointId mapeado
-  ansible.builtin.assert:
-    that:
-      - _endpoint_id is defined
-    fail_msg: "No encuentro endpointId para '{{ st.endpoint }}' en 'endpoints: {}'"
-    success_msg: "endpointId = {{ _endpoint_id }}"
+- name: Crear base de trabajo local
+  ansible.builtin.file:
+    path: "{{ _git_base }}"
+    state: directory
+    mode: "0755"
+  delegate_to: localhost
+  run_once: true
 
-# === 1) Preparar compose localmente (control node) ===
-- name: Clonar repo {{ st.repo_url }} ({{ st.git_ref | default('main') }}) localmente
+# ====== Clonado/actualización del repo (local) ======
+- name: Preparar GIT_SSH_COMMAND si hay deploy key inline
+  ansible.builtin.set_fact:
+    _git_ssh_command: >-
+      {{ 'ssh -o StrictHostKeyChecking=accept-new -i ' ~ github_deploy_key_path
+         if (github_deploy_key_path is defined and github_deploy_key_path|length>0)
+         else omit }}
+  when: github_deploy_key_path is defined and github_deploy_key_path|length > 0
+  delegate_to: localhost
+  run_once: true
+
+- name: Escribir deploy key a archivo temporal (si viene como contenido)
+  ansible.builtin.copy:
+    dest: "{{ _git_base }}/id_rsa"
+    content: "{{ github_deploy_key }}"
+    mode: "0600"
+  when: github_deploy_key is defined and github_deploy_key|length > 0
+  delegate_to: localhost
+  run_once: true
+
+- name: Preparar GIT_SSH_COMMAND (si deploy key fue escrita)
+  ansible.builtin.set_fact:
+    _git_ssh_command: "ssh -o StrictHostKeyChecking=accept-new -i {{ _git_base }}/id_rsa"
+  when: github_deploy_key is defined and github_deploy_key|length > 0
+  delegate_to: localhost
+  run_once: true
+
+- name: Clonar/actualizar repo {{ st.repo_url }} ({{ st.git_ref | default('main') }})
   ansible.builtin.git:
     repo: "{{ st.repo_url }}"
-    dest: "/tmp/portainer_repos/{{ st.name }}"
+    dest: "{{ _repo_dir }}"
     version: "{{ st.git_ref | default('main') }}"
     accept_hostkey: true
-    key_file: "{{ github_deploy_key | default(omit) }}"
     update: true
-    force: true
+  environment: >-
+    {{ ({ 'GIT_SSH_COMMAND': _git_ssh_command } if _git_ssh_command is defined else {}) }}
   delegate_to: localhost
-  run_once: true
 
-- name: Verificar archivo compose existe
+# ====== Leer compose y .env, y normalizar Env ======
+- name: Verificar que el compose exista
   ansible.builtin.stat:
-    path: "/tmp/portainer_repos/{{ st.name }}/{{ st.compose_path }}"
+    path: "{{ _compose_abs }}"
   register: _compose_stat
   delegate_to: localhost
-  run_once: true
 
 - name: Fallar si no existe el compose
-  ansible.builtin.fail:
-    msg: "No se encuentra el compose en {{ st.compose_path }} para stack {{ st.name }}"
-  when: not _compose_stat.stat.exists
-  delegate_to: localhost
-  run_once: true
+  ansible.builtin.assert:
+    that: _compose_stat.stat.exists
+    fail_msg: "No se encontró el compose en {{ _compose_abs }}"
 
 - name: Leer contenido del compose
   ansible.builtin.slurp:
-    path: "/tmp/portainer_repos/{{ st.name }}/{{ st.compose_path }}"
-  register: _compose_b64
+    src: "{{ _compose_abs }}"
+  register: _compose_raw
   delegate_to: localhost
-  run_once: true
 
-- name: Guardar contenido compose decodificado
+- name: Decodificar compose (texto)
   ansible.builtin.set_fact:
-    _compose_content: "{{ _compose_b64.content | b64decode }}"
+    _compose_text: "{{ _compose_raw.content | b64decode }}"
+  delegate_to: localhost
 
-# === 2) Cargar .env (si existe) y SANEAR compose (quitar cualquier env_file) ===
-
-# Paso 2.0: construir rutas sin referenciar variables nuevas en la misma tarea
-- name: Construir ruta absoluta del compose
-  ansible.builtin.set_fact:
-    _compose_abs: "/tmp/portainer_repos/{{ st.name }}/{{ st.compose_path }}"
-
-- name: Calcular directorio del compose
-  ansible.builtin.set_fact:
-    _compose_dir: "{{ _compose_abs | dirname }}"
-
-- name: Calcular ruta del .env junto al compose
-  ansible.builtin.set_fact:
-    _env_file_path: "{{ _compose_dir }}/.env"
-
-- name: Verificar si existe .env
+# Parsear .env si existe
+- name: Verificar si existe .env al lado del compose
   ansible.builtin.stat:
-    path: "{{ _env_file_path }}"
-  register: _env_stat
+    path: "{{ _dotenv_abs }}"
+  register: _dotenv_stat
   delegate_to: localhost
-  run_once: true
 
 - name: Leer .env si existe
   ansible.builtin.slurp:
-    path: "{{ _env_file_path }}"
-  when: _env_stat.stat.exists
-  register: _env_b64
+    src: "{{ _dotenv_abs }}"
+  register: _dotenv_raw
+  when: _dotenv_stat.stat.exists
   delegate_to: localhost
-  run_once: true
 
-- name: Parsear .env a lista Env (name/value)
+- name: Parsear .env a dict
   ansible.builtin.set_fact:
-    _env_list: >-
+    _env_from_dotenv: >-
       {{
-        (_env_b64.content | default('') | b64decode).splitlines()
-        | select('match','^[A-Za-z_][A-Za-z0-9_]*=.*$')
-        | map('regex_replace','^([A-Za-z_][A-Za-z0-9_]*)=(.*)$','{"name":"\\1","value":"\\2"}')
-        | map('from_json')
-        | list
+        dict( (_dotenv_raw.content | default('') | b64decode).splitlines()
+                | select('match','^[A-Za-z_][A-Za-z0-9_]*=.*$')
+                | map('regex_replace','^([^=]+)=(.*)$','\\1|\\2')
+                | map('split','|',1)
+            )
       }}
-  when: _env_stat.stat.exists
+  when: _dotenv_stat.stat.exists
+  delegate_to: localhost
 
-# Saneo agresivo de cualquier env_file (línea simple, lista en corchetes, o bloque multilínea)
-- name: Remover env_file .env (línea simple)
+- name: Convertir dict .env a lista Env
   ansible.builtin.set_fact:
-    _compose_step1: "{{ _compose_content | regex_replace('(?m)^\\s*env_file\\s*:\\s*\\.?/?\\.env\\s*$', '') }}"
+    _env_list_from_dotenv: >-
+      {{ (_env_from_dotenv | default({})).keys()
+          | list
+          | map('community.general.dict_kv', _env_from_dotenv)
+          | map('extract', 'item')
+          | map('combine', {'name': item.key, 'value': item.value})
+          | list }}
+  vars:
+    item: "{{ item | default({}) }}"
+  delegate_to: localhost
 
-- name: Remover env_file con corchetes
+# Fusionar Env: st.env tiene prioridad sobre .env
+- name: Fusionar variables de entorno (st.env sobre .env)
   ansible.builtin.set_fact:
-    _compose_step2: "{{ (_compose_step1 | default(_compose_content))
-                       | regex_replace('(?mi)^\\s*env_file\\s*:\\s*\\[[^\\]]*\\]\\s*$', '') }}"
-
-- name: Remover bloque env_file con lista
-  ansible.builtin.set_fact:
-    _compose_step3: >-
+    _env_final: >-
       {{
-        (_compose_step2 | default(_compose_content))
-        | regex_replace('(?ms)^\\s*env_file\\s*:\\s*\\n(?:\\s*-\\s*\\.?/?\\.env\\s*\\n)+', '')
+        (
+          dict( (_env_list_from_dotenv | default([])) | map(attribute='name') | zip((_env_list_from_dotenv | default([])) | map(attribute='value')) )
+          | combine( dict( (st.env | default([])) | map(attribute='name') | zip((st.env | default([])) | map(attribute='value')) ), recursive=True)
+        )
+        | dict2items(key_name='name', value_name='value')
       }}
+  delegate_to: localhost
 
-- name: Remover líneas sueltas de .env
+# ====== Sanitizar compose: remover env_file ======
+- name: Remover env_file (línea simple)
   ansible.builtin.set_fact:
-    _compose_final: "{{ (_compose_step3 | default(_compose_content))
-                       | regex_replace('(?m)^\\s*-\\s*\\.?/?\\.env\\s*$', '') }}"
+    _compose_text: "{{ _compose_text | regex_replace('(?m)^\\s*env_file\\s*:\\s*\\.env\\s*$', '') }}"
+  delegate_to: localhost
 
-# === 3) Descubrir si el stack existe ===
-- name: Listar stacks existentes (Portainer)
+- name: Remover env_file con lista inline
+  ansible.builtin.set_fact:
+    _compose_text: "{{ _compose_text | regex_replace('(?s)env_file\\s*:\\s*\\[.*?\\]', '') }}"
+  delegate_to: localhost
+
+- name: Remover bloque env_file multilínea
+  ansible.builtin.set_fact:
+    _compose_text: "{{ _compose_text | regex_replace('(?s)^\\s*env_file\\s*:\\s*\\n(\\s*[-].*\\n)+', '') }}"
+  delegate_to: localhost
+
+# ====== Portainer: buscar stack existente por Name+EndpointId ======
+- name: Listar stacks en Portainer
   ansible.builtin.uri:
-    url: "{{ portainer_url }}/api/stacks"
+    url: "{{ portainer_url }}/api/stacks?filters={{ {'EndpointId': endpoint_id} | to_json | urlencode }}"
     method: GET
-    headers:
-      X-API-Key: "{{ portainer_api_token }}"
+    headers: { X-API-Key: "{{ portainer_api_token }}" }
     validate_certs: "{{ portainer_validate_certs | default(false) }}"
     return_content: true
     status_code: 200
   register: _stacks_list
 
-- name: Calcular lista de coincidencias
+- name: Calcular si el stack existe en el endpoint
   ansible.builtin.set_fact:
-    _matches: >-
-      {{
-        _stacks_list.json
-        | selectattr('Name','equalto', st.name)
-        | selectattr('EndpointId','equalto', (_endpoint_id | int))
-        | list
-      }}
+    _matching: "{{ _stacks_list.json | selectattr('Name','equalto', st.name) | list }}"
+    _exists: "{{ (_stacks_list.json | selectattr('Name','equalto', st.name) | list | length) > 0 }}"
+    _stack_id: "{{ (_stacks_list.json | selectattr('Name','equalto', st.name) | list | first).Id if (_stacks_list.json | selectattr('Name','equalto', st.name) | list | length)>0 else 0 }}"
 
-- name: Derivar flags de existencia y stack existente
-  ansible.builtin.set_fact:
-    _exists: "{{ (_matches | length) | int > 0 }}"
-    _existing_stack: "{{ _matches[0] if ((_matches | length) | int > 0) else omit }}"
-
-- name: Debug match
+- name: Debug coincidencia
   ansible.builtin.debug:
     msg:
-      - "Stack '{{ st.name }}' en endpoint {{ _endpoint_id }} => {{ 'EXISTE' if _exists else 'NO EXISTE' }}"
+      - "EndpointId={{ endpoint_id }} | Stack '{{ st.name }}' existe? {{ _exists }}"
+      - "StackId={{ _stack_id | default('N/A') }}"
 
-# === 4) Si existe: borrar (vamos a recrear con compose string) ===
-- name: Borrar stack existente (si aplica)
+# ====== Crear o actualizar ======
+- name: Crear stack (POST /create/standalone/string)
   ansible.builtin.uri:
-    url: "{{ portainer_url }}/api/stacks/{{ _existing_stack.Id }}?endpointId={{ _endpoint_id }}"
-    method: DELETE
+    url: "{{ portainer_url }}/api/stacks/create/standalone/string?endpointId={{ endpoint_id }}"
+    method: POST
     headers:
       X-API-Key: "{{ portainer_api_token }}"
     validate_certs: "{{ portainer_validate_certs | default(false) }}"
-    status_code: 204
-  when: _exists
-  register: _delete_resp
-  changed_when: _exists
+    body_format: json
+    body:
+      Name: "{{ st.name }}"
+      StackFileContent: "{{ _compose_text }}"
+      Env: "{{ _env_final | default([]) }}"
+      Prune: true
+    status_code: [200,201]
+    return_content: true
+  when: not _exists
+  register: _create_resp
 
-# === 5) Crear stack (CE) con method=string (JSON) + fallback form-urlencoded ===
-- name: POST /api/stacks/create/standalone/string (JSON)
-  block:
-    - ansible.builtin.uri:
-        url: "{{ portainer_url }}/api/stacks/create/standalone/string?endpointId={{ _endpoint_id }}"
-        method: POST
-        headers:
-          X-API-Key: "{{ portainer_api_token }}"
-          Content-Type: "application/json"
-        validate_certs: "{{ portainer_validate_certs | default(false) }}"
-        body_format: json
-        body:
-          name: "{{ st.name }}"
-          stackFileContent: "{{ _compose_final | default(_compose_content) }}"
-          env: "{{ (st.env | default([])) + (_env_list | default([])) }}"
-          prune: true
-          pullImage: true
-        status_code: [200, 201]
-      register: _create_json
-      changed_when: true
-  rescue:
-    - name: Crear stack desde contenido de compose (form-urlencoded fallback)
-      ansible.builtin.uri:
-        url: "{{ portainer_url }}/api/stacks/create/standalone/string?endpointId={{ _endpoint_id }}"
-        method: POST
-        headers:
-          X-API-Key: "{{ portainer_api_token }}"
-          Content-Type: "application/x-www-form-urlencoded"
-        validate_certs: "{{ portainer_validate_certs | default(false) }}"
-        body: >-
-          {{ {
-            'Name': st.name,
-            'StackFileContent': (_compose_final | default(_compose_content)),
-            'Prune': 'true',
-            'PullImage': 'true',
-            'Env': ((st.env | default([])) + (_env_list | default([]))) | to_json
-          } | urlencode }}
-        status_code: [200, 201]
-      register: _create_form
-      changed_when: true
+- name: Actualizar stack existente (PUT /stacks/{id})
+  ansible.builtin.uri:
+    url: "{{ portainer_url }}/api/stacks/{{ _stack_id }}?endpointId={{ endpoint_id }}"
+    method: PUT
+    headers:
+      X-API-Key: "{{ portainer_api_token }}"
+    validate_certs: "{{ portainer_validate_certs | default(false) }}"
+    body_format: json
+    body:
+      Prune: true
+      StackFileContent: "{{ _compose_text }}"
+      Env: "{{ _env_final | default([]) }}"
+    status_code: 200
+    return_content: true
+  when: _exists
+  register: _update_resp
+
+- name: Resultado
+  ansible.builtin.debug:
+    msg: >-
+      {{
+        _exists
+        | ternary(
+            'Actualizado stack ' ~ st.name ~ ' (id=' ~ _stack_id | string ~ ')',
+            'Creado stack ' ~ st.name ~ ' (id=' ~ (_create_resp.json.Id | default("desconocido")) | string ~ ')'
+          )
+      }}
