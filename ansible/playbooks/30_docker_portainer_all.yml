@@ -1,0 +1,261 @@
+---
+# =====================================================================
+# 30_docker_portainer_all.yml
+# - Play 1: Instala/actualiza Docker Engine + plugins en core_vms/monitor/agents
+# - Play 2: Despliega/actualiza Portainer Server en grupo [monitor]
+# - Play 3: Despliega/actualiza Portainer Agent en grupo [agent_nodes]
+# Tags útiles: docker, portainer_server, portainer_agent, firewall
+# Requisitos: Ubuntu 22.04+ (ajusta si usas otra)
+# =====================================================================
+
+- name: Install/Upgrade Docker Engine (Ubuntu 22.04+) + compose plugin
+  hosts: core_vms:monitor:agent_nodes
+  gather_facts: true
+  become: true
+  vars:
+    docker_repo_file: /etc/apt/sources.list.d/docker.list
+    docker_keyring: /usr/share/keyrings/docker-archive-keyring.gpg
+    docker_key_tmp: /tmp/docker.gpg.asc
+    docker_key_url: https://download.docker.com/linux/ubuntu/gpg
+    docker_packages:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-buildx-plugin
+      - docker-compose-plugin
+  tasks:
+    - name: Ensure prereqs (curl, gnupg, lsb-release, ca-certificates)
+      apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+        update_cache: yes
+      tags: [docker]
+
+    - name: Remove old docker keys in trusted.gpg.d (cleanup)
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/apt/trusted.gpg.d/docker.gpg
+        - /etc/apt/trusted.gpg.d/docker.asc
+        - /etc/apt/trusted.gpg.d/download.docker.com.gpg
+      changed_when: false
+      tags: [docker]
+
+    - name: Remove previous docker keyring (if any)
+      file:
+        path: "{{ docker_keyring }}"
+        state: absent
+      tags: [docker]
+
+    - name: Download Docker GPG (ASCII) to tmp
+      get_url:
+        url: "{{ docker_key_url }}"
+        dest: "{{ docker_key_tmp }}"
+        mode: "0644"
+      tags: [docker]
+
+    - name: Convert Docker GPG to dearmored keyring
+      command: >
+        gpg --dearmor --yes --output {{ docker_keyring }} {{ docker_key_tmp }}
+      tags: [docker]
+
+    - name: Set permissions on keyring
+      file:
+        path: "{{ docker_keyring }}"
+        mode: "0644"
+        owner: root
+        group: root
+      tags: [docker]
+
+    - name: Detect Ubuntu codename
+      set_fact:
+        ubuntu_codename: "{{ ansible_facts.lsb.codename | default('jammy') }}"
+      tags: [docker]
+
+    - name: Write Docker apt repo (codename + signed-by)
+      copy:
+        dest: "{{ docker_repo_file }}"
+        mode: "0644"
+        content: |
+          deb [arch=amd64 signed-by={{ docker_keyring }}] https://download.docker.com/linux/ubuntu {{ ubuntu_codename }} stable
+      tags: [docker]
+
+    - name: Ensure timesync (helps apt signatures)
+      apt:
+        name: systemd-timesyncd
+        state: present
+      tags: [docker]
+
+    - name: Start & enable timesyncd
+      systemd:
+        name: systemd-timesyncd
+        state: started
+        enabled: true
+      tags: [docker]
+
+    - name: apt-get update (refresh cache)
+      apt:
+        update_cache: yes
+      tags: [docker]
+
+    - name: Install Docker Engine stack (idempotent)
+      apt:
+        name: "{{ docker_packages }}"
+        state: present
+        update_cache: yes
+      tags: [docker]
+
+    - name: Enable & start docker
+      systemd:
+        name: docker
+        state: started
+        enabled: true
+      tags: [docker]
+
+    - name: Add 'ansible' to docker group (si existe)
+      user:
+        name: ansible
+        groups: docker
+        append: true
+      when: ansible_user is defined and ansible_user == "ansible"
+      tags: [docker]
+
+    - name: Show docker and compose version
+      shell: |
+        set -e
+        docker --version
+        docker compose version || true
+      register: docker_versions
+      changed_when: false
+      tags: [docker]
+
+    - debug:
+        var: docker_versions.stdout_lines
+      tags: [docker]
+
+
+- name: Deploy/Upgrade Portainer Server (CE) on monitor
+  hosts: monitor
+  become: true
+  gather_facts: false
+  collections:
+    - community.docker
+  vars:
+    portainer_image: "portainer/portainer-ce:latest"     # pinéalo si quieres congelar versión
+    portainer_data_volume: "portainer_data"
+    portainer_https_port: 9443
+    portainer_http_port: 9000      # elimina este publish si no quieres HTTP
+  tasks:
+    - name: Ensure docker is running
+      command: docker ps
+      changed_when: false
+      tags: [portainer_server]
+
+    - name: Ensure Portainer data volume exists
+      community.docker.docker_volume:
+        name: "{{ portainer_data_volume }}"
+        state: present
+      tags: [portainer_server]
+
+    - name: Pull latest Portainer CE image
+      community.docker.docker_image:
+        name: "{{ portainer_image }}"
+        source: pull
+      tags: [portainer_server]
+
+    - name: Run/Upgrade Portainer CE (recreate on image change)
+      community.docker.docker_container:
+        name: portainer
+        image: "{{ portainer_image }}"
+        restart_policy: unless-stopped
+        recreate: true
+        pull: true
+        state: started
+        published_ports:
+          - "{{ portainer_http_port }}:9000"
+          - "{{ portainer_https_port }}:9443"
+        volumes:
+          - "{{ portainer_data_volume }}:/data"
+          - /var/run/docker.sock:/var/run/docker.sock
+      tags: [portainer_server]
+
+    - name: Show URL
+      debug:
+        msg:
+          - "Portainer listo:"
+          - "  https://{{ hostvars[inventory_hostname].ansible_host | default(inventory_hostname) }}:{{ portainer_https_port }}"
+          - "  http://{{ hostvars[inventory_hostname].ansible_host | default(inventory_hostname) }}:{{ portainer_http_port }} (opcional)"
+          - "Si es el primer arranque, crea el usuario admin al acceder."
+      tags: [portainer_server]
+
+
+- name: Deploy/Upgrade Portainer Agent on all agent nodes
+  hosts: agent_nodes
+  become: true
+  gather_facts: false
+  collections:
+    - community.docker
+  vars:
+    agent_image: "portainer/agent:latest"   # pinéalo si quieres
+    agent_port: 9001
+    # Si usas UFW y quieres limitar al server (monitor), define allow_from como IP/32 (ej: "10.20.0.12/32")
+    allow_from: ""
+  tasks:
+    - name: Ensure Docker is installed (sanity)
+      command: docker --version
+      register: docker_v
+      changed_when: false
+      failed_when: docker_v.rc != 0
+      tags: [portainer_agent]
+
+    - name: Pull latest agent image
+      community.docker.docker_image:
+        name: "{{ agent_image }}"
+        source: pull
+      tags: [portainer_agent]
+
+    - name: Ensure agent container is running (recreate on image change)
+      community.docker.docker_container:
+        name: portainer_agent
+        image: "{{ agent_image }}"
+        restart_policy: unless-stopped
+        recreate: true
+        pull: true
+        state: started
+        published_ports:
+          - "{{ agent_port }}:9001"
+        volumes:
+          - /var/run/docker.sock:/var/run/docker.sock
+          - /var/lib/docker/volumes:/var/lib/docker/volumes
+      tags: [portainer_agent]
+
+    # ---- (Opcional) UFW: abrir 9001 solo desde monitor ----
+    - name: Check if UFW is present
+      command: ufw status
+      register: ufw_status
+      changed_when: false
+      failed_when: false
+      tags: [portainer_agent, firewall]
+
+    - name: Ensure rule for 9001 from monitor (optional)
+      when: ufw_status.rc == 0 and allow_from | length > 0
+      shell: |
+        set -e
+        ufw status | grep -q "{{ agent_port }}/tcp" | grep -q "{{ allow_from }}" || ufw allow from {{ allow_from }} to any port {{ agent_port }} proto tcp
+        ufw reload
+      args:
+        warn: false
+      changed_when: false
+      failed_when: false
+      tags: [portainer_agent, firewall]
+
+    - name: Show agent endpoint
+      debug:
+        msg:
+          - "Agent listo en {{ inventory_hostname }}: {{ hostvars[inventory_hostname].ansible_host | default(inventory_hostname) }}:{{ agent_port }}"
+      tags: [portainer_agent]
