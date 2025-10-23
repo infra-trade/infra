@@ -20,3 +20,10 @@ stacks:
       - { name: AIRFLOW__CORE__EXECUTOR, value: "LocalExecutor" }
       - { name: PUID, value: "50000" }
       - { name: PG_HOST, value: "db-core" }
+
+endpoint_aliases:
+  mon: local
+  airflow: airflow-core
+  kafka: kafka-core
+  spark: spark-core
+  db: db-core
