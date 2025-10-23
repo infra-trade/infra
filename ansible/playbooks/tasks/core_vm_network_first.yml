@@ -1,10 +1,9 @@
 ---
-# Tareas por VM (se incluye desde 21_create_core_vms.yml con loop_var=vm_item)
-# Requiere variables definidas en el play principal:
+# Tareas por VM (se incluye desde el play principal con loop_var=vm_item)
+# Requiere variables en el play:
 # pm_api_host, pm_api_user, pm_api_token_id, pm_api_token_secret, pm_node, validate_certs
 # template_name, storage_system, snippets_store, snippet_name
-# net_bridge, vlan_tag, vlan_gateway, dns_string
-# ssh_wait_timeout
+# net_bridge, vlan_tag, vlan_gateway, dns_string, ssh_wait_timeout, ci_user
 # vm_item.key (nombre VM) / vm_item.value.{vmid,cpu,mem,disk_gb,ip,data_disk_gb}
 
 - name: Eliminar VM previa (best-effort)
@@ -21,7 +20,7 @@
     force: true
   failed_when: false
 
-- name: Clonar desde template (mínimo, sin red/ip aquí)
+- name: Clonar desde template (cores/mem ya del catálogo)
   community.proxmox.proxmox_kvm:
     api_host: "{{ pm_api_host }}"
     api_user: "{{ pm_api_user }}"
@@ -36,11 +35,12 @@
     storage: "{{ storage_system }}"
     memory: "{{ vm_item.value.mem }}"
     cores: "{{ vm_item.value.cpu }}"
-    scsihw: virtio-scsi-single
+    scsihw: virtio-scsi-pci
     state: present
     timeout: 240
 
-# Cicustom: user-data (común) + meta-data (hostname por VM)
+# ==== Ajustes cloud-init y red ====
+
 - name: Subir meta-data (hostname) para {{ vm_item.key }}
   copy:
     dest: "/var/lib/vz/snippets/meta-{{ vm_item.key }}.yml"
@@ -51,7 +51,7 @@
   delegate_to: "{{ pm_api_host }}"
   become: true
 
-- name: Forzar cloud-init + NIC vmbr1/VLAN e IP (update) usando cicustom (user+meta)
+- name: Forzar cloud-init (ide2) + IP/puente/VLAN + DNS
   community.proxmox.proxmox_kvm:
     api_host: "{{ pm_api_host }}"
     api_user: "{{ pm_api_user }}"
@@ -61,24 +61,43 @@
     node: "{{ pm_node }}"
     vmid: "{{ vm_item.value.vmid }}"
     update: true
-    # Disco de cloud-init
     ide:
       ide2: "{{ storage_system }}:cloudinit"
     citype: "nocloud"
-    # user-data común (snippet_name) + meta-data por VM (hostname)
     cicustom: "user={{ snippets_store }}:snippets/{{ snippet_name }},meta={{ snippets_store }}:snippets/meta-{{ vm_item.key }}.yml"
-
-    # Red/IP por cloud-init
     ipconfig:
       ipconfig0: "ip={{ vm_item.value.ip }},gw={{ vlan_gateway }}"
     nameservers: "{{ dns_string }}"
     net:
       net0: "virtio,bridge={{ net_bridge }},tag={{ vlan_tag }}"
-
-    # Extras
     agent: 1
     onboot: true
     timeout: 240
+
+# ==== Discos ====
+# 1) Redimensionar DISCO RAÍZ (scsi0) al tamaño del catálogo
+#    En LVM-thin el tamaño se pasa como número (GB), sin sufijo.
+- name: Redimensionar disco raíz scsi0 al tamaño del catálogo
+  delegate_to: "{{ pm_api_host }}"
+  become: true
+  command: >
+    qm set {{ vm_item.value.vmid }}
+    --scsi0 {{ storage_system }}:{{ vm_item.value.disk_gb }}
+  changed_when: true
+
+# 2) Añadir disco de datos /data (scsi1) si se definió
+- name: Añadir disco de datos scsi1 (thin) para /data
+  delegate_to: "{{ pm_api_host }}"
+  become: true
+  command: >
+    qm set {{ vm_item.value.vmid }}
+    --scsi1 {{ storage_system }}:{{ vm_item.value.data_disk_gb }},ssd=1,discard=on,iothread=1
+  when:
+    - vm_item.value.data_disk_gb is defined
+    - vm_item.value.data_disk_gb|int > 0
+  changed_when: true
+
+# ==== Encendido y espera SSH ====
 
 - name: Arrancar VM
   community.proxmox.proxmox_kvm:
@@ -99,14 +118,42 @@
     delay: 5
     timeout: "{{ ssh_wait_timeout }}"
 
-# === Opción A (recomendada): añadir disco de datos con `qm set`
-# IMPORTANTE: en local-lvm (LVM-thin) el tamaño NO lleva sufijo "G", se pasa solo el número (GB).
-- name: Añadir disco de datos scsi1 (thin) con qm set
-  delegate_to: "{{ pm_api_host }}"
+# ==== Post-boot dentro de la VM ====
+# Crece la partición raíz detectando el dispositivo correcto (sda1, sda2, nvme0n1p3, etc.)
+- name: Detectar y expandir root dentro de la VM
+  ansible.builtin.shell: |
+    set -eux
+    dev="$(findmnt -n -o SOURCE /)"        # ej: /dev/sda1 o /dev/nvme0n1p3
+    pk="$(lsblk -no PKNAME "$dev")"        # ej: sda o nvme0n1
+    pt="$(lsblk -no PARTNO "$dev")"        # ej: 1 o 3
+    command -v growpart >/dev/null || (apt-get update || true; apt-get install -y cloud-guest-utils || true)
+    growpart "/dev/$pk" "$pt" || true
+    fs="$(blkid -o value -s TYPE "$dev")"
+    if [ "$fs" = "xfs" ]; then
+      xfs_growfs /
+    else
+      resize2fs "$dev" || true
+    fi
+  args:
+    executable: /bin/bash
+  vars:
+    ansible_user: "{{ ci_user }}"
+  delegate_to: "{{ (vm_item.value.ip | string).split('/')[0] }}"
   become: true
-  command: >
-    qm set {{ vm_item.value.vmid }}
-    --scsi1 {{ storage_system }}:{{ vm_item.value.data_disk_gb }},ssd=1,discard=on,iothread=1
-  when:
-    - vm_item.value.data_disk_gb is defined
-    - vm_item.value.data_disk_gb|int > 0
+
+# Prepara /data en scsi1 (si existe sdb)
+- name: Formatear y montar /data si existe /dev/sdb
+  ansible.builtin.shell: |
+    set -eux
+    if lsblk -no NAME | grep -q '^sdb$'; then
+      blkid -L DATA >/dev/null 2>&1 || mkfs.ext4 -F -L DATA /dev/sdb
+      mkdir -p /data
+      grep -q '^LABEL=DATA ' /etc/fstab || echo 'LABEL=DATA /data ext4 defaults,nofail 0 2' >> /etc/fstab
+      mount -a
+    fi
+  args:
+    executable: /bin/bash
+  vars:
+    ansible_user: "{{ ci_user }}"
+  delegate_to: "{{ (vm_item.value.ip | string).split('/')[0] }}"
+  become: true
