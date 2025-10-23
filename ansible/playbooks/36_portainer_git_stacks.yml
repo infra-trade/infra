@@ -17,15 +17,15 @@
     - name: Assert API token present
       ansible.builtin.assert:
         that:
-          - "{{ portainer_api_token | length > 0 }}"
+          - portainer_api_token | length > 0
         fail_msg: "No Portainer API key. Export PORTAINER_TOKEN or set portainer_token in group_vars."
 
     - name: Assert basic variables
       ansible.builtin.assert:
         that:
-          - "{{ portainer_url is defined }}"
-          - "{{ stacks is defined }}"
-          - "{{ stacks | length > 0 }}"
+          - portainer_url is defined
+          - stacks is defined
+          - stacks | length > 0
         success_msg: "Basic variables present."
 
     - name: Portainer connectivity check
@@ -62,57 +62,9 @@
         var: endpoints_list
 
   tasks:
-    - name: Resolve endpoint and deploy stack
-      vars:
-        _endpoint_raw: "{{ st.endpoint | string }}"
-      block:
-        # Case 1: numeric endpoint id given
-        - name: Use numeric endpoint id if provided
-          ansible.builtin.set_fact:
-            endpoint_id: "{{ _endpoint_raw | int }}"
-            resolved_endpoint_name: "__by_id__"
-          when: "{{ _endpoint_raw is match('^[0-9]+$') }}"
-
-        # Case 2: exact name match
-        - name: Resolve by exact endpoint name
-          ansible.builtin.set_fact:
-            endpoint_id: "{{ endpoints_map[_endpoint_raw] }}"
-            resolved_endpoint_name: "{{ _endpoint_raw }}"
-          when: "{{ (endpoint_id is not defined) and (_endpoint_raw in endpoints_map) }}"
-
-        # Case 3: alias map (user-defined or defaults)
-        - name: Resolve by alias map
-          ansible.builtin.set_fact:
-            endpoint_id: "{{ endpoints_map[ endpoint_aliases_effective[_endpoint_raw] ] }}"
-            resolved_endpoint_name: "{{ endpoint_aliases_effective[_endpoint_raw] }}"
-          when: "{{ (endpoint_id is not defined) and (_endpoint_raw in endpoint_aliases_effective) and (endpoint_aliases_effective[_endpoint_raw] in endpoints_map) }}"
-
-        # Case 4: heuristic suffix "-core"
-        - name: Resolve by heuristic suffix "-core"
-          ansible.builtin.set_fact:
-            endpoint_id: "{{ endpoints_map[_endpoint_raw ~ '-core'] }}"
-            resolved_endpoint_name: "{{ _endpoint_raw ~ '-core' }}"
-          when: "{{ (endpoint_id is not defined) and ((_endpoint_raw ~ '-core') in endpoints_map) }}"
-
-        # Case 5: specific "mon" -> "local" (safety net)
-        - name: Resolve "mon" to "local" if available
-          ansible.builtin.set_fact:
-            endpoint_id: "{{ endpoints_map['local'] }}"
-            resolved_endpoint_name: "local"
-          when: "{{ (endpoint_id is not defined) and (_endpoint_raw == 'mon') and ('local' in endpoints_map) }}"
-
-        # Final validation
-        - name: Fail if endpoint_id was not resolved
-          ansible.builtin.fail:
-            msg: >-
-              Could not resolve endpoint '{{ _endpoint_raw }}'.
-              Available endpoints: {{ endpoints_names }}
-              Define 'endpoint_aliases' in group_vars or use the exact endpoint name.
-          when: "{{ endpoint_id is not defined }}"
-
-        # Include the stack task (expects endpoint_id, st, and Portainer vars)
-        - name: Include tasks/portainer_stack.yml
-          ansible.builtin.include_tasks: "tasks/portainer_stack.yml"
+    # Hacemos loop sobre include_tasks (válido); cada iteración resuelve endpoint y despliega
+    - name: Resolve endpoint and deploy stack (per item)
+      ansible.builtin.include_tasks: "tasks/resolve_portainer_endpoint_and_deploy.yml"
       loop: "{{ stacks }}"
       loop_control:
         loop_var: st

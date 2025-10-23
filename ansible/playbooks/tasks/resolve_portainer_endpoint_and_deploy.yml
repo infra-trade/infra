@@ -1,0 +1,56 @@
+---
+# Recibe: st (stack item), endpoints_map, endpoint_aliases_effective, endpoints_names
+# También hereda: portainer_url, portainer_api_token, portainer_validate_certs
+# Resultado: set_fact endpoint_id y resolved_endpoint_name; luego incluye tasks/portainer_stack.yml
+
+- name: Prepare raw endpoint name
+  ansible.builtin.set_fact:
+    _endpoint_raw: "{{ st.endpoint | string }}"
+
+# Case 1: numeric endpoint id given
+- name: Use numeric endpoint id if provided
+  ansible.builtin.set_fact:
+    endpoint_id: "{{ _endpoint_raw | int }}"
+    resolved_endpoint_name: "__by_id__"
+  when: _endpoint_raw is match('^[0-9]+$')
+
+# Case 2: exact name match
+- name: Resolve by exact endpoint name
+  ansible.builtin.set_fact:
+    endpoint_id: "{{ endpoints_map[_endpoint_raw] }}"
+    resolved_endpoint_name: "{{ _endpoint_raw }}"
+  when: endpoint_id is not defined and (_endpoint_raw in endpoints_map)
+
+# Case 3: alias map (user-defined or defaults)
+- name: Resolve by alias map
+  ansible.builtin.set_fact:
+    endpoint_id: "{{ endpoints_map[ endpoint_aliases_effective[_endpoint_raw] ] }}"
+    resolved_endpoint_name: "{{ endpoint_aliases_effective[_endpoint_raw] }}"
+  when: endpoint_id is not defined and (_endpoint_raw in endpoint_aliases_effective) and (endpoint_aliases_effective[_endpoint_raw] in endpoints_map)
+
+# Case 4: heuristic suffix "-core"
+- name: Resolve by heuristic suffix "-core"
+  ansible.builtin.set_fact:
+    endpoint_id: "{{ endpoints_map[_endpoint_raw ~ '-core'] }}"
+    resolved_endpoint_name: "{{ _endpoint_raw ~ '-core' }}"
+  when: endpoint_id is not defined and ((_endpoint_raw ~ '-core') in endpoints_map)
+
+# Case 5: specific "mon" -> "local" (safety net)
+- name: Resolve "mon" to "local" if available
+  ansible.builtin.set_fact:
+    endpoint_id: "{{ endpoints_map['local'] }}"
+    resolved_endpoint_name: "local"
+  when: endpoint_id is not defined and _endpoint_raw == 'mon' and ('local' in endpoints_map)
+
+# Final validation
+- name: Fail if endpoint_id was not resolved
+  ansible.builtin.fail:
+    msg: >-
+      Could not resolve endpoint '{{ _endpoint_raw }}'.
+      Available endpoints: {{ endpoints_names }}
+      Define 'endpoint_aliases' in group_vars or use the exact endpoint name.
+  when: endpoint_id is not defined
+
+# Deploy/update the stack using the resolved endpoint_id
+- name: Include tasks/portainer_stack.yml
+  ansible.builtin.include_tasks: "tasks/portainer_stack.yml"
