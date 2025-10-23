@@ -1,81 +1,80 @@
 ---
-# Despliega/actualiza stacks en Portainer CE resolviendo endpointId dinámicamente
-# Requiere en group_vars/all.yml:
-#   portainer_url, portainer_token (o export PORTAINER_TOKEN), portainer_validate_certs
-#   stacks: [ {name, endpoint, repo_url, compose_path, git_ref, env[]} ]
-# Opcional: endpoint_aliases: { mon: local, airflow: airflow-core, ... }
+# 36_portainer_git_stacks.yml
+# Create/Update Portainer stacks resolving endpointId dynamically by name or numeric id.
 
 - name: Create/Update Portainer stacks from Git (dynamic endpointId)
   hosts: mon-core
   gather_facts: false
 
   vars:
-    # Token de API (env tiene prioridad)
+    # API token: environment var has priority, else var from group_vars
     portainer_api_token: "{{ lookup('env','PORTAINER_TOKEN') | default(portainer_token | default(''), true) }}"
-    # Aliases por defecto (puedes sobreescribir/añadir en group_vars con `endpoint_aliases`)
+    # Default aliases (you can add/override in group_vars with endpoint_aliases)
     endpoint_aliases_default:
       mon: local
 
   pre_tasks:
-    - name: Afirmar token presente
+    - name: Assert API token present
       ansible.builtin.assert:
-        that: portainer_api_token | length > 0
-        fail_msg: "No hay API key de Portainer. Exporta PORTAINER_TOKEN o define portainer_token en group_vars."
+        that:
+          - portainer_api_token | length > 0
+        fail_msg: "No Portainer API key. Export PORTAINER_TOKEN or set portainer_token in group_vars."
 
-    - name: Afirmar variables básicas
+    - name: Assert basic variables
       ansible.builtin.assert:
         that:
           - portainer_url is defined
           - stacks is defined
           - stacks | length > 0
-        success_msg: "Variables básicas presentes."
+        success_msg: "Basic variables present."
 
-    - name: Probar conectividad con Portainer
+    - name: Portainer connectivity check
       ansible.builtin.uri:
         url: "{{ portainer_url }}/api/system/status"
         method: GET
-        headers: { X-API-Key: "{{ portainer_api_token }}" }
+        headers:
+          X-API-Key: "{{ portainer_api_token }}"
         validate_certs: "{{ portainer_validate_certs | default(false) }}"
         return_content: true
         status_code: 200
       register: _status
 
-    - name: Obtener lista de endpoints desde Portainer
+    - name: Fetch endpoints from Portainer
       ansible.builtin.uri:
         url: "{{ portainer_url }}/api/endpoints?limit=1000"
         method: GET
-        headers: { X-API-Key: "{{ portainer_api_token }}" }
+        headers:
+          X-API-Key: "{{ portainer_api_token }}"
         validate_certs: "{{ portainer_validate_certs | default(false) }}"
         return_content: true
         status_code: 200
       register: _endpoints
 
-    - name: Construir mapa nombre→Id y lista para debug
+    - name: Build endpoints maps/lists
       ansible.builtin.set_fact:
-        endpoints_map: "{{ dict(_endpoints.json | json_query('[].{k: Name, v: Id}') | map(attribute='k') | zip(_endpoints.json | json_query('[].{k: Name, v: Id}') | map(attribute='v'))) }}"
+        endpoints_map: "{{ dict( (_endpoints.json | map(attribute='Name') | list) | zip(_endpoints.json | map(attribute='Id') | list) ) }}"
         endpoints_names: "{{ _endpoints.json | map(attribute='Name') | list }}"
         endpoints_list: "{{ _endpoints.json | json_query('[].{Id: Id, Name: Name, URL: URL, PublicURL: PublicURL, Type: Type}') }}"
         endpoint_aliases_effective: "{{ endpoint_aliases_default | combine(endpoint_aliases | default({}), recursive=True) }}"
 
-    - name: Mostrar endpoints detectados (auditoría)
+    - name: Show detected endpoints (audit)
       ansible.builtin.debug:
         var: endpoints_list
 
   tasks:
-    # Procesa cada stack individualmente, resolviendo endpoint_id antes de incluir el task
-    - name: Resolver endpoint y desplegar stack
+    - name: Resolve endpoint and deploy stack
       vars:
         _endpoint_raw: "{{ st.endpoint | string }}"
       block:
-        # 1) Si ya es ID numérico, úsalo tal cual
-        - name: Resolver endpoint_id si endpoint es numérico
+        # Case 1: numeric endpoint id given
+        - name: Use numeric endpoint id if provided
           ansible.builtin.set_fact:
             endpoint_id: "{{ _endpoint_raw | int }}"
             resolved_endpoint_name: "__by_id__"
           when: _endpoint_raw is match('^[0-9]+$')
 
-        # 2) Coincidencia exacta por nombre
-        - name: Resolver por coincidencia exacta de nombre
+        # Case 2: exact name match
+        - name: Resolve by exact endpoint name
           ansible.builtin.set_fact:
             endpoint_id: "{{ endpoints_map[_endpoint_raw] }}"
             resolved_endpoint_name: "{{ _endpoint_raw }}"
@@ -83,8 +82,8 @@
             - endpoint_id is not defined
             - _endpoint_raw in endpoints_map
 
-        # 3) Alias definidos por el usuario (o defaults)
-        - name: Resolver por alias definido
+        # Case 3: alias map (user-defined or defaults)
+        - name: Resolve by alias map
           ansible.builtin.set_fact:
             endpoint_id: "{{ endpoints_map[ endpoint_aliases_effective[_endpoint_raw] ] }}"
             resolved_endpoint_name: "{{ endpoint_aliases_effective[_endpoint_raw] }}"
@@ -93,17 +92,17 @@
             - _endpoint_raw in endpoint_aliases_effective
             - endpoint_aliases_effective[_endpoint_raw] in endpoints_map
 
-        # 4) Heurística: agregar sufijo "-core"
-        - name: Resolver por heurística -core
+        # Case 4: heuristic suffix "-core"
+        - name: Resolve by heuristic suffix "-core"
           ansible.builtin.set_fact:
-            endpoint_id: "{{ endpoints_map[ _endpoint_raw ~ '-core' ] }}"
+            endpoint_id: "{{ endpoints_map[_endpoint_raw ~ '-core'] }}"
             resolved_endpoint_name: "{{ _endpoint_raw ~ '-core' }}"
           when:
             - endpoint_id is not defined
             - (_endpoint_raw ~ '-core') in endpoints_map
 
-        # 5) Heurística específica: "mon" → "local" (si no lo captó el alias default)
-        - name: Resolver "mon" → "local"
+        # Case 5: specific "mon" -> "local" (safety net)
+        - name: Resolve "mon" to "local" if available
           ansible.builtin.set_fact:
             endpoint_id: "{{ endpoints_map['local'] }}"
             resolved_endpoint_name: "local"
@@ -112,17 +111,17 @@
             - _endpoint_raw == 'mon'
             - 'local' in endpoints_map
 
-        # 6) Validación final
-        - name: Fallar si no se resolvió endpoint_id
+        # Final validation
+        - name: Fail if endpoint_id was not resolved
           ansible.builtin.fail:
             msg: >-
-              No se pudo resolver el endpoint '{{ _endpoint_raw }}'.
-              Endpoints disponibles: {{ endpoints_names }}
-              Define 'endpoint_aliases' en group_vars o usa el nombre exacto.
+              Could not resolve endpoint '{{ _endpoint_raw }}'.
+              Available endpoints: {{ endpoints_names }}
+              Define 'endpoint_aliases' in group_vars or use the exact endpoint name.
           when: endpoint_id is not defined
 
-        # 7) Llamar al task que crea/actualiza el stack, con endpoint_id resuelto
-        - name: Incluir tasks/portainer_stack.yml (deploy/update)
+        # Include the stack task (expects endpoint_id, st, and Portainer vars)
+        - name: Include tasks/portainer_stack.yml
           ansible.builtin.include_tasks: "tasks/portainer_stack.yml"
       loop: "{{ stacks }}"
       loop_control:
