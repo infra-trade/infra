@@ -1,5 +1,5 @@
 ---
-- name: Create/Update core VMs per catalog (clone, cpu/ram, net, resize root/data, growfs & housekeeping)
+- name: Create/Update core VMs per catalog (clone, cpu/ram, net, resize root/data, growfs)
   hosts: localhost
   gather_facts: false
 
@@ -14,12 +14,12 @@
     pm_api_token_secret: "{{ lookup('env','PM_API_TOKEN_SECRET') }}"
     pm_node: "pve1"
     validate_certs: false
-    pve_ssh_host: "192.168.100.100"    # host para delegate_to en tareas qm/archivo .conf
+    pve_ssh_host: "192.168.100.100"   # host para delegate_to
 
     # ===== Template y storages =====
     template_name: "ubuntu-22.04-cloudinit"     # marcado como template
-    storage_system: "local-lvm"                  # LVM-thin
-    snippets_store: "local"                      # con snippets habilitado
+    storage_system: "local-lvm"                 # LVM-thin
+    snippets_store: "local"                     # con snippets habilitado
 
     # ===== Red / VLAN =====
     net_bridge: "vmbr1"
@@ -31,10 +31,10 @@
     ci_user: "ansible"          # usuario creado por tu user-data
     ssh_wait_timeout: 420
 
-    # ===== Cloud-init user-data ya existente en /var/lib/vz/snippets/ =====
+    # ===== Cloud-init user-data ya existente =====
     snippet_name: "user-data-core.yml"
 
-    # ===== Umbral de espacio mínimo (para limpieza ligera previa a growfs) =====
+    # ===== Limpieza mínima dentro del guest si / tiene poco espacio =====
     min_free_mb: 300
 
     # ===== Catálogo de VMs =====
@@ -60,280 +60,239 @@
       become: true
 
   tasks:
-    - name: Procesar cada VM del catálogo
-      block:
-
-        # ---------- CLONE ----------
-        # (Si quieres conservar VMs existentes, comenta las dos tareas de "absent")
-        - name: Eliminar VM previa (best-effort)
-          community.proxmox.proxmox_kvm:
-            api_host: "{{ pm_api_host }}"
-            api_user: "{{ pm_api_user }}"
-            api_token_id: "{{ pm_api_token_id }}"
-            api_token_secret: "{{ pm_api_token_secret }}"
-            validate_certs: "{{ validate_certs }}"
-            node: "{{ pm_node }}"
-            vmid: "{{ item.value.vmid }}"
-            state: absent
-            purge: true
-            force: true
-          failed_when: false
-
-        - name: Clonar desde template
-          community.proxmox.proxmox_kvm:
-            api_host: "{{ pm_api_host }}"
-            api_user: "{{ pm_api_user }}"
-            api_token_id: "{{ pm_api_token_id }}"
-            api_token_secret: "{{ pm_api_token_secret }}"
-            validate_certs: "{{ validate_certs }}"
-            node: "{{ pm_node }}"
-            name: "{{ item.key }}"
-            newid: "{{ item.value.vmid }}"
-            clone: "{{ template_name }}"
-            full: true
-            storage: "{{ storage_system }}"
-            scsihw: virtio-scsi-pci
-            state: present
-            timeout: 240
-
-        # ---------- CPU / RAM ----------
-        - name: Ajustar CPU/RAM del catálogo (update explícito)
-          community.proxmox.proxmox_kvm:
-            api_host: "{{ pm_api_host }}"
-            api_user: "{{ pm_api_user }}"
-            api_token_id: "{{ pm_api_token_id }}"
-            api_token_secret: "{{ pm_api_token_secret }}"
-            validate_certs: "{{ validate_certs }}"
-            node: "{{ pm_node }}"
-            vmid: "{{ item.value.vmid }}"
-            update: true
-            memory: "{{ item.value.mem }}"
-            cores: "{{ item.value.cpu }}"
-            sockets: 1
-            vga: serial0
-            serial:
-              serial0: socket
-            scsihw: virtio-scsi-pci
-            agent: 1
-            onboot: true
-            timeout: 240
-
-        # ---------- cloud-init + red ----------
-        - name: Subir meta-data (hostname)
-          copy:
-            dest: "/var/lib/vz/snippets/meta-{{ item.key }}.yml"
-            mode: "0644"
-            content: |
-              instance-id: {{ item.value.vmid }}
-              local-hostname: {{ item.key }}
-          delegate_to: "{{ pve_ssh_host }}"
-          become: true
-
-        - name: Configurar cloud-init, IP, gateway, DNS y bridge/VLAN
-          community.proxmox.proxmox_kvm:
-            api_host: "{{ pm_api_host }}"
-            api_user: "{{ pm_api_user }}"
-            api_token_id: "{{ pm_api_token_id }}"
-            api_token_secret: "{{ pm_api_token_secret }}"
-            validate_certs: "{{ validate_certs }}"
-            node: "{{ pm_node }}"
-            vmid: "{{ item.value.vmid }}"
-            update: true
-            ide:
-              ide2: "{{ storage_system }}:cloudinit"
-            citype: "nocloud"
-            cicustom: "user={{ snippets_store }}:snippets/{{ snippet_name }},meta={{ snippets_store }}:snippets/meta-{{ item.key }}.yml"
-            ipconfig:
-              ipconfig0: "ip={{ item.value.ip }},gw={{ vlan_gateway }}"
-            nameservers: "{{ dns_string }}"
-            net:
-              net0: "virtio,bridge={{ net_bridge }},tag={{ vlan_tag }}"
-            timeout: 240
-
-        # ---------- Disco raíz: detectar bus y resize al tamaño del catálogo ----------
-        - name: Detectar bus del disco raíz (scsi0/virtio0/sata0/ide0)
-          delegate_to: "{{ pve_ssh_host }}"
-          become: true
-          shell: |
-            set -e
-            conf="/etc/pve/qemu-server/{{ item.value.vmid }}.conf"
-            awk -F: '/^(scsi0|virtio0|sata0|ide0):/ {print $1; exit}' "$conf"
-          args: { executable: /bin/bash }
-          register: root_bus
-
-        - name: Leer tamaño actual del disco raíz (GB)
-          delegate_to: "{{ pve_ssh_host }}"
-          become: true
-          shell: |
-            set -e
-            conf="/etc/pve/qemu-server/{{ item.value.vmid }}.conf"
-            line="$(awk -F: '/^{{ root_bus.stdout | regex_escape }}:/ {print $2; exit}' "$conf")"
-            size="$(echo "$line" | sed -n 's/.*size=\([0-9]\+\)G.*/\1/p')"
-            echo "${size:-0}"
-          args: { executable: /bin/bash }
-          register: current_size_gb
-
-        - name: Calcular delta de crecimiento (GB)
-          set_fact:
-            desired_size_gb: "{{ item.value.disk_gb | int }}"
-            current_size_int: "{{ (current_size_gb.stdout | default('0')) | int }}"
-            grow_delta_gb: "{{ (item.value.disk_gb | int) - ((current_size_gb.stdout | default('0')) | int) }}"
-
-        - name: Redimensionar disco raíz con qm resize (+ΔG si falta)
-          delegate_to: "{{ pve_ssh_host }}"
-          become: true
-          command: >
-            qm resize {{ item.value.vmid }} {{ root_bus.stdout }} +{{ grow_delta_gb }}G
-          when:
-            - root_bus.stdout | length > 0
-            - grow_delta_gb | int > 0
-
-        # ---------- Disco de datos /data ----------
-        - name: Verificar existencia de scsi1
-          delegate_to: "{{ pve_ssh_host }}"
-          become: true
-          shell: |
-            conf="/etc/pve/qemu-server/{{ item.value.vmid }}.conf"
-            awk -F: '/^scsi1:/ {print $0; exit}' "$conf" || true
-          args: { executable: /bin/bash }
-          register: scsi1_line
-          when: item.value.data_disk_gb is defined
-
-        - name: Crear scsi1 si no existe
-          delegate_to: "{{ pve_ssh_host }}"
-          become: true
-          command: >
-            qm set {{ item.value.vmid }} --scsi1 {{ storage_system }}:{{ item.value.data_disk_gb }}
-          when:
-            - item.value.data_disk_gb is defined
-            - scsi1_line.stdout | length == 0
-
-        - name: Si existe scsi1 y es menor, crecerlo
-          delegate_to: "{{ pve_ssh_host }}"
-          become: true
-          shell: |
-            conf="/etc/pve/qemu-server/{{ item.value.vmid }}.conf"
-            line="$(awk -F: '/^scsi1:/ {print $2; exit}' "$conf")"
-            cur="$(echo "$line" | sed -n 's/.*size=\([0-9]\+\)G.*/\1/p')"
-            des={{ item.value.data_disk_gb | int }}
-            if [ -n "$cur" ] && [ "$cur" -lt "$des" ]; then
-              delta=$((des - cur))
-              qm resize {{ item.value.vmid }} scsi1 +${delta}G
-            fi
-          args: { executable: /bin/bash }
-          when:
-            - item.value.data_disk_gb is defined
-            - scsi1_line.stdout | length > 0
-
-        # ---------- Power on & espera SSH ----------
-        - name: Arrancar VM
-          community.proxmox.proxmox_kvm:
-            api_host: "{{ pm_api_host }}"
-            api_user: "{{ pm_api_user }}"
-            api_token_id: "{{ pm_api_token_id }}"
-            api_token_secret: "{{ pm_api_token_secret }}"
-            validate_certs: "{{ validate_certs }}"
-            node: "{{ pm_node }}"
-            vmid: "{{ item.value.vmid }}"
-            state: started
-            timeout: 240
-
-        - name: Esperar a que SSH responda
-          wait_for:
-            host: "{{ (item.value.ip | string).split('/')[0] }}"
-            port: 22
-            delay: 5
-            timeout: "{{ ssh_wait_timeout }}"
-
-        # ---------- Dentro del guest: limpieza mínima + grow root (LVM / no-LVM) + /data ----------
-        - name: MB libres iniciales en /
-          raw: "df -Pm / | awk 'NR==2{print $4}'"
-          register: free0
-          delegate_to: "{{ (item.value.ip | string).split('/')[0] }}"
-          become: true
-
-        - name: Si hay poco espacio, hacer limpieza ligera
-          block:
-            - raw: |
-                systemctl stop docker 2>/dev/null || true
-                systemctl stop containerd 2>/dev/null || true
-              changed_when: false
-            - raw: |
-                rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock
-                rm -rf /var/lib/apt/lists/*
-                apt-get clean || true
-              changed_when: false
-            - raw: |
-                journalctl --vacuum-time=1d 2>/dev/null || true
-                find /var/log -type f -size +10M -exec truncate -s 0 {} \; 2>/dev/null || true
-                rm -rf /tmp/* /var/tmp/* 2>/dev/null || true
-              changed_when: false
-            - raw: "dpkg --configure -a || true"
-              changed_when: false
-          when: (free0.stdout | default('0') | int) < min_free_mb
-          delegate_to: "{{ (item.value.ip | string).split('/')[0] }}"
-          become: true
-
-        - name: Detectar dispositivo y fs de /
-          raw: "findmnt -no SOURCE,FSTYPE /"
-          register: root_info
-          delegate_to: "{{ (item.value.ip | string).split('/')[0] }}"
-          become: true
-
-        - name: Normalizar variables de raíz
-          set_fact:
-            ROOT_SOURCE: "{{ (root_info.stdout | trim).split(' ')[0] }}"
-            ROOT_FSTYPE: "{{ (root_info.stdout | trim).split(' ')[1] | lower }}"
-
-        # ---- Rama LVM ----
-        - block:
-            - raw: "pvs --noheadings -o pv_name | awk 'NF{print $1; exit}'"
-              register: pv_dev
-              changed_when: false
-            - raw: "pvresize {{ pv_dev.stdout | trim }}"
-              when: pv_dev.stdout is search('^/dev/')
-            - raw: "df -PTh | awk '$7==\"/\"{print $1}'"
-              register: lv_path
-              changed_when: false
-            - raw: "lvextend -r -l +100%FREE {{ lv_path.stdout | trim }}"
-              when: lv_path.stdout is search('^/dev/')
-          when: ROOT_SOURCE is match('^/dev/mapper/')
-          delegate_to: "{{ (item.value.ip | string).split('/')[0] }}"
-          become: true
-
-        # ---- Rama NO-LVM (partición directa) ----
-        - block:
-            - set_fact:
-                PART_PATH: "{{ ROOT_SOURCE }}"
-                DISK_PATH: "{{ ROOT_SOURCE | regex_replace('[0-9]+$','') }}"
-                PART_NUM:  "{{ ROOT_SOURCE | regex_search('[0-9]+$') }}"
-            - raw: |
-                command -v growpart >/dev/null 2>&1 || (apt-get update -o Acquire::ForceIPv4=true && DEBIAN_FRONTEND=noninteractive apt-get install -y cloud-guest-utils)
-                growpart {{ DISK_PATH }} {{ PART_NUM }}
-            - raw: "blkid -o value -s TYPE {{ PART_PATH }}"
-              register: fstype_now
-              changed_when: false
-            - raw: "resize2fs {{ PART_PATH }}"
-              when: (fstype_now.stdout | trim | lower) == "ext4"
-            - raw: "xfs_growfs /"
-              when: (fstype_now.stdout | trim | lower) == "xfs"
-          when: ROOT_SOURCE is match('^/dev/[sv]d[a-z]*[0-9]+|^/dev/nvme[0-9]+n[0-9]+p[0-9]+')
-          delegate_to: "{{ (item.value.ip | string).split('/')[0] }}"
-          become: true
-
-        # ---- /data (sdb) dentro del guest ----
-        - name: Formatear y montar /data si existe /dev/sdb
-          raw: |
-            if lsblk -no NAME | grep -q '^sdb$'; then
-              blkid -L DATA >/dev/null 2>&1 || mkfs.ext4 -F -L DATA /dev/sdb
-              mkdir -p /data
-              grep -q '^LABEL=DATA ' /etc/fstab || echo 'LABEL=DATA /data ext4 defaults,nofail 0 2' >> /etc/fstab
-              mount -a
-            fi
-          delegate_to: "{{ (item.value.ip | string).split('/')[0] }}"
-          become: true
-          changed_when: false
-
+    # --- (Opcional) eliminar VMs existentes ---
+    - name: Eliminar VM previa (best-effort)
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ pm_api_host }}"
+        api_user: "{{ pm_api_user }}"
+        api_token_id: "{{ pm_api_token_id }}"
+        api_token_secret: "{{ pm_api_token_secret }}"
+        validate_certs: "{{ validate_certs }}"
+        node: "{{ pm_node }}"
+        vmid: "{{ item.value.vmid }}"
+        state: absent
+        purge: true
+        force: true
+      failed_when: false
       loop: "{{ vmlist }}"
-      loop_control:
-        label: "{{ item.key }}"
+      loop_control: { label: "{{ item.key }}" }
+
+    # --- Clonado ---
+    - name: Clonar desde template
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ pm_api_host }}"
+        api_user: "{{ pm_api_user }}"
+        api_token_id: "{{ pm_api_token_id }}"
+        api_token_secret: "{{ pm_api_token_secret }}"
+        validate_certs: "{{ validate_certs }}"
+        node: "{{ pm_node }}"
+        name: "{{ item.key }}"
+        newid: "{{ item.value.vmid }}"
+        clone: "{{ template_name }}"
+        full: true
+        storage: "{{ storage_system }}"
+        scsihw: virtio-scsi-pci
+        state: present
+        timeout: 240
+      loop: "{{ vmlist }}"
+      loop_control: { label: "{{ item.key }}" }
+
+    # --- CPU/RAM (update explícito) ---
+    - name: Ajustar CPU/RAM del catálogo
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ pm_api_host }}"
+        api_user: "{{ pm_api_user }}"
+        api_token_id: "{{ pm_api_token_id }}"
+        api_token_secret: "{{ pm_api_token_secret }}"
+        validate_certs: "{{ validate_certs }}"
+        node: "{{ pm_node }}"
+        vmid: "{{ item.value.vmid }}"
+        update: true
+        memory: "{{ item.value.mem }}"
+        cores: "{{ item.value.cpu }}"
+        sockets: 1
+        vga: serial0
+        serial:
+          serial0: socket
+        scsihw: virtio-scsi-pci
+        agent: 1
+        onboot: true
+        timeout: 240
+      loop: "{{ vmlist }}"
+      loop_control: { label: "{{ item.key }}" }
+
+    # --- cloud-init + red ---
+    - name: Subir meta-data (hostname)
+      copy:
+        dest: "/var/lib/vz/snippets/meta-{{ item.key }}.yml"
+        mode: "0644"
+        content: |
+          instance-id: {{ item.value.vmid }}
+          local-hostname: {{ item.key }}
+      delegate_to: "{{ pve_ssh_host }}"
+      become: true
+      loop: "{{ vmlist }}"
+      loop_control: { label: "{{ item.key }}" }
+
+    - name: Configurar cloud-init, IP, gateway, DNS y bridge/VLAN
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ pm_api_host }}"
+        api_user: "{{ pm_api_user }}"
+        api_token_id: "{{ pm_api_token_id }}"
+        api_token_secret: "{{ pm_api_token_secret }}"
+        validate_certs: "{{ validate_certs }}"
+        node: "{{ pm_node }}"
+        vmid: "{{ item.value.vmid }}"
+        update: true
+        ide:
+          ide2: "{{ storage_system }}:cloudinit"
+        citype: "nocloud"
+        cicustom: "user={{ snippets_store }}:snippets/{{ snippet_name }},meta={{ snippets_store }}:snippets/meta-{{ item.key }}.yml"
+        ipconfig:
+          ipconfig0: "ip={{ item.value.ip }},gw={{ vlan_gateway }}"
+        nameservers: "{{ dns_string }}"
+        net:
+          net0: "virtio,bridge={{ net_bridge }},tag={{ vlan_tag }}"
+        timeout: 240
+      loop: "{{ vmlist }}"
+      loop_control: { label: "{{ item.key }}" }
+
+    # --- Disco raíz: detectar bus y resize al tamaño del catálogo (todo en una tarea por VM) ---
+    - name: Ajustar tamaño de disco raíz al catálogo (detecta bus y hace qm resize si falta)
+      delegate_to: "{{ pve_ssh_host }}"
+      become: true
+      shell: |
+        set -e
+        VMID="{{ item.value.vmid }}"
+        DES="{{ item.value.disk_gb | int }}"   # tamaño deseado en GB
+        CONF="/etc/pve/qemu-server/${VMID}.conf"
+        # Detectar bus raíz: scsi0/virtio0/sata0/ide0
+        BUS="$(awk -F: '/^(scsi0|virtio0|sata0|ide0):/ {print $1; exit}' "$CONF")"
+        [ -z "$BUS" ] && { echo "No se detectó bus raíz en $CONF"; exit 1; }
+        # Tamaño actual (GB)
+        LINE="$(awk -F: -v b="$BUS" '$1==b{print $2; exit}' "$CONF")"
+        CUR="$(echo "$LINE" | sed -n 's/.*size=\([0-9]\+\)G.*/\1/p')"
+        CUR="${CUR:-0}"
+        if [ "$DES" -gt "$CUR" ]; then
+          DELTA=$((DES - CUR))
+          echo "VM $VMID: $BUS crece de ${CUR}G a ${DES}G (+${DELTA}G)"
+          qm resize "$VMID" "$BUS" +${DELTA}G
+        else
+          echo "VM $VMID: tamaño actual ${CUR}G >= deseado ${DES}G, no cambio."
+        fi
+      args: { executable: /bin/bash }
+      loop: "{{ vmlist }}"
+      loop_control: { label: "{{ item.key }}" }
+
+    # --- Disco de datos /data: crear o crecer si es menor ---
+    - name: Crear/ajustar scsi1 para /data según catálogo
+      delegate_to: "{{ pve_ssh_host }}"
+      become: true
+      shell: |
+        set -e
+        VMID="{{ item.value.vmid }}"
+        DES="{{ item.value.data_disk_gb | default(0) | int }}"
+        [ "$DES" -le 0 ] && { echo "Sin data_disk_gb para $VMID, omito."; exit 0; }
+        CONF="/etc/pve/qemu-server/${VMID}.conf"
+        LINE="$(awk -F: '/^scsi1:/{print $2; exit}' "$CONF")"
+        if [ -z "$LINE" ]; then
+          echo "VM $VMID: creando scsi1 de ${DES}G"
+          qm set "$VMID" --scsi1 "{{ storage_system }}:${DES}"
+          exit 0
+        fi
+        CUR="$(echo "$LINE" | sed -n 's/.*size=\([0-9]\+\)G.*/\1/p')"
+        CUR="${CUR:-0}"
+        if [ "$DES" -gt "$CUR" ]; then
+          DELTA=$((DES - CUR))
+          echo "VM $VMID: scsi1 crece de ${CUR}G a ${DES}G (+${DELTA}G)"
+          qm resize "$VMID" scsi1 +${DELTA}G
+        else
+          echo "VM $VMID: scsi1 actual ${CUR}G >= deseado ${DES}G, no cambio."
+        fi
+      args: { executable: /bin/bash }
+      when: item.value.data_disk_gb is defined
+      loop: "{{ vmlist }}"
+      loop_control: { label: "{{ item.key }}" }
+
+    # --- Encender y esperar SSH ---
+    - name: Arrancar VM
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ pm_api_host }}"
+        api_user: "{{ pm_api_user }}"
+        api_token_id: "{{ pm_api_token_id }}"
+        api_token_secret: "{{ pm_api_token_secret }}"
+        validate_certs: "{{ validate_certs }}"
+        node: "{{ pm_node }}"
+        vmid: "{{ item.value.vmid }}"
+        state: started
+        timeout: 240
+      loop: "{{ vmlist }}"
+      loop_control: { label: "{{ item.key }}" }
+
+    - name: Esperar a que SSH responda
+      wait_for:
+        host: "{{ (item.value.ip | string).split('/')[0] }}"
+        port: 22
+        delay: 5
+        timeout: "{{ ssh_wait_timeout }}"
+      loop: "{{ vmlist }}"
+      loop_control: { label: "{{ item.key }}" }
+
+    # --- Dentro del guest: limpieza ligera + crecer raíz (LVM/No-LVM) + /data ---
+    - name: Crecer partición/FS de / y preparar /data dentro del guest
+      shell: |
+        set -eux
+        # Limpieza mínima si hay poco espacio
+        free0="$(df -Pm / | awk 'NR==2{print $4}')"
+        if [ "${free0:-0}" -lt {{ min_free_mb }} ]; then
+          systemctl stop docker 2>/dev/null || true
+          systemctl stop containerd 2>/dev/null || true
+          rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock || true
+          rm -rf /var/lib/apt/lists/* || true
+          apt-get clean || true
+          journalctl --vacuum-time=1d 2>/dev/null || true
+          find /var/log -type f -size +10M -exec truncate -s 0 {} \; 2>/dev/null || true
+          rm -rf /tmp/* /var/tmp/* 2>/dev/null || true
+          dpkg --configure -a || true
+        fi
+
+        # Detectar raíz
+        read ROOT_SOURCE ROOT_FSTYPE < <(findmnt -no SOURCE,FSTYPE /)
+        ROOT_FSTYPE="$(echo "$ROOT_FSTYPE" | tr '[:upper:]' '[:lower:]')"
+
+        if echo "$ROOT_SOURCE" | grep -q '^/dev/mapper/'; then
+          # LVM
+          pv="$(pvs --noheadings -o pv_name | awk 'NF{print $1; exit}')"
+          if [ -n "$pv" ]; then pvresize "$pv" || true; fi
+          lv_path="$(df -PTh | awk '$7=="/"{print $1}')"
+          if echo "$lv_path" | grep -q '^/dev/'; then
+            lvextend -r -l +100%FREE "$lv_path" || true
+          fi
+        else
+          # NO-LVM
+          PART_PATH="$ROOT_SOURCE"
+          DISK_PATH="$(echo "$PART_PATH" | sed -E 's/[0-9]+$//')"
+          PART_NUM="$(echo "$PART_PATH" | sed -nE 's/.*([0-9]+)$/\1/p')"
+          command -v growpart >/dev/null 2>&1 || (apt-get update -o Acquire::ForceIPv4=true && DEBIAN_FRONTEND=noninteractive apt-get install -y cloud-guest-utils)
+          growpart "$DISK_PATH" "$PART_NUM" || true
+          if [ "$ROOT_FSTYPE" = "xfs" ]; then
+            xfs_growfs /
+          else
+            resize2fs "$PART_PATH" || true
+          fi
+        fi
+
+        # /data si existe sdb
+        if lsblk -no NAME | grep -q '^sdb$'; then
+          blkid -L DATA >/dev/null 2>&1 || mkfs.ext4 -F -L DATA /dev/sdb
+          mkdir -p /data
+          grep -q '^LABEL=DATA ' /etc/fstab || echo 'LABEL=DATA /data ext4 defaults,nofail 0 2' >> /etc/fstab
+          mount -a || true
+        fi
+      args: { executable: /bin/bash }
+      vars:
+        ansible_user: "{{ ci_user }}"
+      delegate_to: "{{ (item.value.ip | string).split('/')[0] }}"
+      become: true
+      loop: "{{ vmlist }}"
+      loop_control: { label: "{{ item.key }}" }
