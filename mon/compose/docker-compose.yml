@@ -1,19 +1,11 @@
 version: "3.8"
 
 services:
-  prometheus:
-    image: prom/prometheus:v2.55.0
-    container_name: mon-prometheus
-    command:
-      - "--config.file=/etc/prometheus/prometheus.yml"
-      - "--storage.tsdb.path=/prometheus"
-      - "--storage.tsdb.retention.time=15d"
-      - "--web.enable-lifecycle"
+  hola:
+    image: python:3.12-alpine
+    container_name: hola_mundo
+    command: >
+      sh -c "echo 'Hola Mundo' > index.html && python -m http.server 8080"
     ports:
-      - "9090:9090"
-    volumes:
-      # Config desde host (la subimos con el playbook de sync)
-      - /srv/iac/mon/prometheus/conf:/etc/prometheus:ro
-      # Datos en NFS (montado en el host mon-core pero vive en db-core)
-      - /srv/iac/mon/prometheus/data:/prometheus
+      - "8080:8080"
     restart: unless-stopped
