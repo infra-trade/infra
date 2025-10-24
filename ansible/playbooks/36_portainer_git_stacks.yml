@@ -53,8 +53,8 @@
 
     - name: Build endpoints maps/lists
       ansible.builtin.set_fact:
-        endpoints_by_name: "{{ dict( (_endpoints.json | map(attribute='Name') | list)
-                             | zip(_endpoints.json | map(attribute='Id') | list) ) }}"
+        endpoints_map: "{{ dict( (_endpoints.json | map(attribute='Name') | list)
+                           | zip(_endpoints.json | map(attribute='Id') | list) ) }}"
         endpoints_list: "{{ _endpoints.json | json_query('[].{Id: Id, Name: Name, URL: URL, PublicURL: PublicURL, Type: Type}') }}"
         # nombre interno para evitar colisiones con group_vars
         __alias_map: "{{ endpoint_aliases_default | combine(endpoint_aliases | default({}), recursive=True) }}"
@@ -83,5 +83,6 @@
         portainer_url: "{{ portainer_url_effective }}"
         portainer_api_token: "{{ portainer_api_token }}"
         portainer_validate_certs: "{{ portainer_validate_certs }}"
-        endpoints_by_name: "{{ endpoints_by_name }}"
+        # PASAMOS con nombres distintos para evitar recursión
+        endpoints_map: "{{ endpoints_map }}"
         alias_map: "{{ __alias_map }}"

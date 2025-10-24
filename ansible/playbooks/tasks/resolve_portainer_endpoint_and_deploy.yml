@@ -22,9 +22,9 @@
       {%- elif st.endpoint is defined -%}
         {%- set e = st.endpoint -%}
         {%- set alias = alias_map.get(e, e) -%}
-        {{ endpoints_by_name.get(alias) | default(endpoints_by_name.get(e)) | default('') }}
+        {{ endpoints_map.get(alias) | default(endpoints_map.get(e)) | default('') }}
       {%- else -%}
-      {{ endpoints_by_name.get('local') | default('') }}
+      {{ endpoints_map.get('local') | default('') }}
       {%- endif -%}
 
 - name: Fail if endpoint cannot be resolved for {{ st.name }}
