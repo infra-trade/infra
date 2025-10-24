@@ -72,6 +72,11 @@ atomic_deploy:
   enable: true
   keep_releases: 5
 
-# Version pinning para Portainer CE y Agent (usadas en 30_docker_portainer_all.yml)
+# Version pinning para Portainer (ambos formatos, por compatibilidad con distintos plays):
+# - Si algún play usa imagen completa → usa portainer_image / agent_image
+# - Si algún play arma "portainer/portainer-ce:{{ portainer_ce_version }}" → usa *_ce_version
 portainer_image: "portainer/portainer-ce:2.21.5"
 agent_image:     "portainer/agent:2.21.5"
+
+portainer_ce_version: "2.21.5"
+portainer_agent_version: "2.21.5"
