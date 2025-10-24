@@ -1,54 +1,49 @@
 ---
 # =============================================================================
-# Create/Update Portainer stacks from Git (dynamic endpointId via API)
+# Create/Update Portainer stacks from Git (dynamic endpointId)
 #
-# Requiere en group_vars/all.yml:
-#   portainer_url: "https://10.20.0.12:9443"
-#   portainer_validate_certs: false
-#   stacks:  # ver ejemplo en tu group_vars/all.yml
-#   endpoint_aliases: # p.ej. mon: local, airflow: airflow-core, etc.
-#
-# Requiere variable de entorno en el controlador:
-#   PORTAINER_TOKEN=<API KEY>   # no usar JWT, usar API key de Portainer
+# Requiere:
+#   - export PORTAINER_TOKEN='TU_API_KEY'  (API key de Portainer)
+#   - group_vars/all.yml con:
+#       portainer_url, portainer_validate_certs, stacks
+#       (endpoint_aliases es OPCIONAL; si no existe, se usa {}).
 # =============================================================================
 
 - name: Create/Update Portainer stacks from Git (dynamic endpointId)
   hosts: mon-core
   gather_facts: false
+
   vars:
     portainer_api_key: "{{ lookup('env', 'PORTAINER_TOKEN') }}"
-    # tiempo de espera total y backoff para readiness de Portainer
+    # si endpoint_aliases no existe, usa {} para no fallar
+    endpoint_aliases_eff: "{{ endpoint_aliases | default({}) }}"
     readiness_retries: 20
     readiness_delay: 6
-  tasks:
 
+  tasks:
+    # -------------------- Validaciones básicas --------------------
     - name: Assert API token present
       ansible.builtin.assert:
         that:
-          - portainer_api_key is defined
           - portainer_api_key | length > 0
-        fail_msg: >-
-          PORTAINER_TOKEN no está exportado en el controlador.
-          Ejecuta:  export PORTAINER_TOKEN='TU_API_KEY'
+        fail_msg: "PORTAINER_TOKEN no está exportado en el controlador. Ejecuta: export PORTAINER_TOKEN='TU_API_KEY'"
 
-    - name: Assert basic variables
+    - name: Assert required variables exist
       ansible.builtin.assert:
         that:
           - portainer_url is defined
           - portainer_validate_certs is defined
           - stacks is defined
-          - endpoint_aliases is defined
         success_msg: "Basic variables present."
 
-    # -------------------- Readiness / Conectividad --------------------
-
-    - name: Wait for TCP 9443 to be open
+    # -------------------- Conectividad / Readiness --------------------
+    - name: Wait for TCP {{ (portainer_url | urlsplit('hostname')) }}:{{ (portainer_url | urlsplit('port')) | default(9443) }}
       ansible.builtin.wait_for:
         host: "{{ (portainer_url | urlsplit('hostname')) }}"
         port: "{{ (portainer_url | urlsplit('port')) | default(9443) | int }}"
         timeout: 180
 
-    - name: Wait for Portainer /api/status to be healthy (no auth)
+    - name: Wait for /api/status (no auth)
       ansible.builtin.uri:
         url: "{{ portainer_url }}/api/status"
         method: GET
@@ -70,19 +65,24 @@
         headers:
           X-API-Key: "{{ portainer_api_key }}"
         return_content: true
-        status_code: [200]
+        status_code: [200,401,403,404,500]
       register: conn_check
       changed_when: false
       no_log: true  # oculta headers con API key
 
+    - name: Fail with clear message if API check != 200
+      ansible.builtin.fail:
+        msg: >-
+          Portainer no aceptó la conexión con API key. HTTP {{ conn_check.status }}.
+          Causas típicas: API key inválida/expirada (401/403), URL incorrecta o Portainer no listo (5xx).
+          Verifica PORTAINER_TOKEN y portainer_url={{ portainer_url }}.
+      when: conn_check.status != 200
+
     - name: Show connectivity check result (safe)
       ansible.builtin.debug:
-        msg:
-          - "Portainer system/status OK (200)"
-          - "Length: {{ (conn_check.content | default('')) | length }} bytes"
+        msg: "Portainer system/status OK (200)."
 
-    # -------------------- Descubrir Endpoints --------------------
-
+    # -------------------- Endpoints --------------------
     - name: Get endpoints list
       ansible.builtin.uri:
         url: "{{ portainer_url }}/api/endpoints?limit=1000"
@@ -97,31 +97,25 @@
 
     - name: Build endpoints map name->id
       ansible.builtin.set_fact:
-        endpoints_map: >-
-          {{
-            (endpoints_resp.json | items2dict(key_name='Name', value_name='Id'))
-          }}
+        endpoints_map: "{{ (endpoints_resp.json | items2dict(key_name='Name', value_name='Id')) | default({}) }}"
 
     - name: Debug endpoints discovered (safe)
       ansible.builtin.debug:
         msg: >-
           Endpoints disponibles: {{
-            (endpoints_resp.json | map(attribute='Name') | list) | join(', ')
+            (endpoints_resp.json | map(attribute='Name') | list | default([])) | join(', ')
           }}
 
     # -------------------- Resolver endpointId por stack --------------------
-
     - name: Prepare stacks with resolved endpointId
       ansible.builtin.set_fact:
         stacks_resolved: >-
           {{
             stacks | map('combine', {
-              'endpoint_name': (
-                endpoint_aliases[item.endpoint] | default(item.endpoint)
-              ),
+              'endpoint_name': (endpoint_aliases_eff[item.endpoint] | default(item.endpoint)),
               'endpoint_id': (
-                endpoints_map[endpoint_aliases[item.endpoint] | default(item.endpoint)]
-                  if (endpoint_aliases[item.endpoint] | default(item.endpoint)) in endpoints_map
+                endpoints_map[endpoint_aliases_eff[item.endpoint] | default(item.endpoint)]
+                  if (endpoint_aliases_eff[item.endpoint] | default(item.endpoint)) in endpoints_map
                   else None
               )
             }) | list
@@ -137,7 +131,7 @@
         msg: >-
           Endpoint '{{ item.endpoint_name }}' (para stack '{{ item.name }}')
           no existe en Portainer. Endpoints válidos: {{
-            (endpoints_resp.json | map(attribute='Name') | list) | join(', ')
+            (endpoints_resp.json | map(attribute='Name') | list | default([])) | join(', ')
           }}
       when: item.endpoint_id is not defined or item.endpoint_id is none
       loop: "{{ stacks_resolved }}"
@@ -145,7 +139,6 @@
         label: "{{ item.name }}"
 
     # -------------------- Upsert de Stacks desde Git --------------------
-
     - name: Search existing stack by name
       ansible.builtin.uri:
         url: "{{ portainer_url }}/api/stacks?filters={\"Name\":\"{{ item.name }}\"}"
@@ -186,8 +179,7 @@
 
     - name: Create stack from Git if not exists (type=2 compose)
       ansible.builtin.uri:
-        url: >-
-          {{ portainer_url }}/api/stacks?type=2&method=repository&endpointId={{ item.endpoint_id }}
+        url: "{{ portainer_url }}/api/stacks?type=2&method=repository&endpointId={{ item.endpoint_id }}"
         method: POST
         validate_certs: "{{ portainer_validate_certs }}"
         headers:
@@ -201,8 +193,6 @@
           RepositoryReferenceName: "{{ item.git_ref }}"
           ComposeFilePathInRepository: "{{ item.compose_path }}"
           RepositoryAuthentication: false
-          # Si tu repo es privado por SSH, Portainer usa deploy keys propias;
-          # si requieres user/pass, setea RepositoryAuthentication true y agrega credenciales.
           Env: "{{ item.env | default([]) }}"
           Prune: true
           PullImage: true
@@ -216,8 +206,7 @@
 
     - name: Update existing stack from Git (compose) with prune+pull
       ansible.builtin.uri:
-        url: >-
-          {{ portainer_url }}/api/stacks/{{ item.existing_id }}?endpointId={{ item.endpoint_id }}
+        url: "{{ portainer_url }}/api/stacks/{{ item.existing_id }}?endpointId={{ item.endpoint_id }}"
         method: PUT
         validate_certs: "{{ portainer_validate_certs }}"
         headers:
@@ -229,7 +218,6 @@
           PullImage: true
           RepositoryReferenceName: "{{ item.git_ref }}"
           ComposeFilePathInRepository: "{{ item.compose_path }}"
-          # Para update la clave es "Environment"
           Environment: "{{ item.env | default([]) }}"
         status_code: [200]
       register: update_resp
