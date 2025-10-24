@@ -1,71 +1,108 @@
 ---
-# Recibe: st (stack item), endpoints_map, endpoint_aliases_effective, endpoints_names
-# Hereda: portainer_url, portainer_api_token, portainer_validate_certs
-# Resultado: set_fact endpoint_id y resolved_endpoint_name; prepara workspace local; incluye tasks/portainer_stack.yml
+# Espera las vars:
+#   st: { name, repo_url, git_ref, file_path, endpoint | endpoint_id, env, prune }
+#   portainer_url, portainer_api_token, portainer_validate_certs
+#   endpoints_by_name, endpoint_aliases_effective
 
-- name: Prepare raw endpoint name
+- name: Validate required fields for stack {{ st.name }}
+  ansible.builtin.assert:
+    that:
+      - st.name is defined
+      - st.repo_url is defined
+      - st.file_path is defined
+    fail_msg: "Faltan campos en stack {{ st | to_nice_json }}"
+
+- name: Resolve endpointId for {{ st.name }}
   ansible.builtin.set_fact:
-    _endpoint_raw: "{{ st.endpoint | string }}"
+    _endpoint_id_resolved: >-
+      {%- if st.endpoint_id is defined -%}
+      {{ st.endpoint_id }}
+      {%- elif st.endpoint is defined -%}
+        {%- set e = st.endpoint -%}
+        {%- set alias = endpoint_aliases_effective.get(e, e) -%}
+        {{ endpoints_by_name.get(alias) | default(endpoints_by_name.get(e)) | default('') }}
+      {%- else -%}
+      {{ endpoints_by_name.get('local') | default('') }}
+      {%- endif -%}
 
-# Case 1: numeric endpoint id given
-- name: Use numeric endpoint id if provided
+- name: Fail if endpoint cannot be resolved for {{ st.name }}
+  ansible.builtin.assert:
+    that: _endpoint_id_resolved | string | length > 0
+    fail_msg: "No se pudo resolver endpointId para stack {{ st.name }} (endpoint='{{ st.endpoint | default('') }}')."
+
+# --------------------- Buscar si el stack ya existe ---------------------
+- name: Fetch stacks list
+  ansible.builtin.uri:
+    url: "{{ portainer_url }}/api/stacks"
+    method: GET
+    headers: { X-API-Key: "{{ portainer_api_token }}" }
+    validate_certs: "{{ portainer_validate_certs }}"
+    status_code: 200
+    return_content: true
+  register: _stacks
+
+- name: Find existing stack id by name (exact match)
   ansible.builtin.set_fact:
-    endpoint_id: "{{ _endpoint_raw | int }}"
-    resolved_endpoint_name: "__by_id__"
-  when: _endpoint_raw is match('^[0-9]+$')
+    _existing_stack: "{{ (_stacks.json | selectattr('Name','equalto', st.name) | list | first) | default(None) }}"
+    _existing_stack_id: "{{ ((_stacks.json | selectattr('Name','equalto', st.name) | list | first).Id) | default(None) }}"
 
-# Case 2: exact name match
-- name: Resolve by exact endpoint name
-  ansible.builtin.set_fact:
-    endpoint_id: "{{ endpoints_map[_endpoint_raw] }}"
-    resolved_endpoint_name: "{{ _endpoint_raw }}"
-  when: endpoint_id is not defined and (_endpoint_raw in endpoints_map)
+# --------------------- Crear si no existe ---------------------
+- name: Create stack {{ st.name }} from repository (compose/standalone)
+  when: _existing_stack_id is not defined
+  ansible.builtin.uri:
+    url: "{{ portainer_url }}/api/stacks/create?type=2&method=repository&endpointId={{ _endpoint_id_resolved }}"
+    method: POST
+    headers:
+      X-API-Key: "{{ portainer_api_token }}"
+      Content-Type: "application/json"
+    validate_certs: "{{ portainer_validate_certs }}"
+    status_code: 200, 201
+    body_format: json
+    body:
+      Name: "{{ st.name }}"
+      RepositoryURL: "{{ st.repo_url }}"
+      RepositoryReferenceName: "{{ st.git_ref | default('main') }}"
+      ComposeFilePathInRepository: "{{ st.file_path }}"
+      Env: "{{ st.env | default([]) }}"
+      Prune: "{{ st.prune | default(true) }}"
+      # Si usas Git privado vía SSH, puedes añadir:
+      # RepositoryAuthentication: true
+      # RepositoryGitCredentialID: 0
+      # RepositoryPassword: "{{ lookup('env','PORTAINER_PRIVATE_KEY') | default(omit) }}"
+  register: _create
 
-# Case 3: alias map (user-defined or defaults)
-- name: Resolve by alias map
-  ansible.builtin.set_fact:
-    endpoint_id: "{{ endpoints_map[ endpoint_aliases_effective[_endpoint_raw] ] }}"
-    resolved_endpoint_name: "{{ endpoint_aliases_effective[_endpoint_raw] }}"
-  when: endpoint_id is not defined and (_endpoint_raw in endpoint_aliases_effective) and (endpoint_aliases_effective[_endpoint_raw] in endpoints_map)
+# --------------------- Redeploy si existe (pull + prune) ---------------------
+- name: Update git reference (optional) on existing stack {{ st.name }}
+  when: _existing_stack_id is defined and (st.git_ref is defined or st.file_path is defined)
+  ansible.builtin.uri:
+    url: "{{ portainer_url }}/api/stacks/{{ _existing_stack_id }}"
+    method: PUT
+    headers:
+      X-API-Key: "{{ portainer_api_token }}"
+      Content-Type: "application/json"
+    validate_certs: "{{ portainer_validate_certs }}"
+    status_code: 200
+    body_format: json
+    body:
+      # Partial update: solo campos relevantes
+      RepositoryReferenceName: "{{ st.git_ref | default(omit) }}"
+      ComposeFilePathInRepository: "{{ st.file_path | default(omit) }}"
+  register: _update
+  failed_when: false
 
-# Case 4: heuristic suffix "-core"
-- name: Resolve by heuristic suffix "-core"
-  ansible.builtin.set_fact:
-    endpoint_id: "{{ endpoints_map[_endpoint_raw ~ '-core'] }}"
-    resolved_endpoint_name: "{{ _endpoint_raw ~ '-core' }}"
-  when: endpoint_id is not defined and ((_endpoint_raw ~ '-core') in endpoints_map)
-
-# Case 5: specific "mon" -> "local" (safety net)
-- name: Resolve "mon" to "local" if available
-  ansible.builtin.set_fact:
-    endpoint_id: "{{ endpoints_map['local'] }}"
-    resolved_endpoint_name: "local"
-  when: endpoint_id is not defined and _endpoint_raw == 'mon' and ('local' in endpoints_map)
-
-# Final validation
-- name: Fail if endpoint_id was not resolved
-  ansible.builtin.fail:
-    msg: >-
-      Could not resolve endpoint '{{ _endpoint_raw }}'.
-      Available endpoints: {{ endpoints_names }}
-      Define 'endpoint_aliases' in group_vars or use the exact endpoint name.
-  when: endpoint_id is not defined
-
-# === PREDEFINE workspace local para evitar variables indefinidas en el include siguiente ===
-- name: Prepare local workspace vars for this stack
-  ansible.builtin.set_fact:
-    _git_base: "{{ lookup('env','HOME') ~ '/.cache/portainer-stacks' }}"
-    _repo_dir: >-
-      {{
-        lookup('env','HOME') ~ '/.cache/portainer-stacks/' ~
-        (st.repo_url | regex_replace('[^A-Za-z0-9_.-]', '_')) ~ '_' ~
-        (st.git_ref | default('main'))
-      }}
-    _compose_rel: "{{ st.compose_path }}"
-    _compose_abs: "{{ (lookup('env','HOME') ~ '/.cache/portainer-stacks/' ~ (st.repo_url | regex_replace('[^A-Za-z0-9_.-]', '_')) ~ '_' ~ (st.git_ref | default('main'))) ~ '/' ~ st.compose_path }}"
-    _compose_dir: "{{ ((lookup('env','HOME') ~ '/.cache/portainer-stacks/' ~ (st.repo_url | regex_replace('[^A-Za-z0-9_.-]', '_')) ~ '_' ~ (st.git_ref | default('main'))) ~ '/' ~ st.compose_path) | dirname }}"
-    _dotenv_abs: "{{ (((lookup('env','HOME') ~ '/.cache/portainer-stacks/' ~ (st.repo_url | regex_replace('[^A-Za-z0-9_.-]', '_')) ~ '_' ~ (st.git_ref | default('main'))) ~ '/' ~ st.compose_path) | dirname) ~ '/.env' }}"
-
-# Deploy/update the stack using the resolved endpoint_id
-- name: Include tasks/portainer_stack.yml
-  ansible.builtin.include_tasks: "tasks/portainer_stack.yml"
+- name: Git redeploy (pull & prune) existing stack {{ st.name }}
+  when: _existing_stack_id is defined
+  ansible.builtin.uri:
+    url: "{{ portainer_url }}/api/stacks/{{ _existing_stack_id }}/git/redeploy?endpointId={{ _endpoint_id_resolved }}"
+    method: POST
+    headers:
+      X-API-Key: "{{ portainer_api_token }}"
+      Content-Type: "application/json"
+    validate_certs: "{{ portainer_validate_certs }}"
+    status_code: 200
+    body_format: json
+    body:
+      Prune: "{{ st.prune | default(true) }}"
+      PullImage: true
+      Env: "{{ st.env | default([]) }}"
+  register: _redeploy

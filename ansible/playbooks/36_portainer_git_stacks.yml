@@ -1,59 +1,67 @@
 ---
 # 36_portainer_git_stacks.yml
-# Create/Update Portainer stacks resolving endpointId dynamically by name or numeric id.
+# Crea/actualiza Portainer stacks desde Git, resolviendo endpointId por nombre/alias/ID.
 
 - name: Create/Update Portainer stacks from Git (dynamic endpointId)
   hosts: mon-core
   gather_facts: false
 
   vars:
-    # API token: environment var has priority, else var from group_vars
+    # 1) URL del Portainer Server en mon-core (o fija la tuya)
+    portainer_url: "{{ portainer_url | default('https://' ~ (hostvars[inventory_hostname].ansible_host | default(inventory_hostname)) ~ ':9443') }}"
+    portainer_validate_certs: "{{ portainer_validate_certs | default(false) }}"
+
+    # 2) API token: entorno > group_vars
     portainer_api_token: "{{ lookup('env','PORTAINER_TOKEN') | default(portainer_token | default(''), true) }}"
-    # Default aliases (you can add/override in group_vars with endpoint_aliases)
+
+    # 3) Aliases (puedes sobreescribir en group_vars con endpoint_aliases)
     endpoint_aliases_default:
       mon: local
+      airflow: airflow-core
+      kafka: kafka-core
+      spark: spark-core
+      db: db-core
+
+    # 4) Define aquí o en group_vars los stacks a desplegar
+    #    Campos soportados por cada item 'st':
+    #      - name: nombre del stack en Portainer
+    #      - repo_url: URL repo (https o ssh)
+    #      - git_ref: rama/tag (default: main)
+    #      - file_path: ruta al docker-compose dentro del repo
+    #      - endpoint: nombre del endpoint o alias (opcional si das endpoint_id)
+    #      - endpoint_id: numérico (opcional)
+    #      - env: lista de { name: "VAR", value: "val" } (opcional)
+    #      - prune: bool (default true)
+    stacks: "{{ stacks | default([]) }}"
 
   pre_tasks:
-    - name: Assert API token present
+    - name: Fail early if token missing
       ansible.builtin.assert:
-        that:
-          - portainer_api_token | length > 0
-        fail_msg: "No Portainer API key. Export PORTAINER_TOKEN or set portainer_token in group_vars."
+        that: portainer_api_token | length > 0
+        fail_msg: "Falta API key. Exporta PORTAINER_TOKEN o define portainer_token en group_vars."
 
-    - name: Assert basic variables
-      ansible.builtin.assert:
-        that:
-          - portainer_url is defined
-          - stacks is defined
-          - stacks | length > 0
-        success_msg: "Basic variables present."
-
-    - name: Portainer connectivity check
+    - name: Check Portainer is reachable
       ansible.builtin.uri:
         url: "{{ portainer_url }}/api/system/status"
         method: GET
-        headers:
-          X-API-Key: "{{ portainer_api_token }}"
-        validate_certs: "{{ portainer_validate_certs | default(false) }}"
-        return_content: true
+        headers: { X-API-Key: "{{ portainer_api_token }}" }
+        validate_certs: "{{ portainer_validate_certs }}"
         status_code: 200
       register: _status
 
-    - name: Fetch endpoints from Portainer
+    - name: Fetch endpoints
       ansible.builtin.uri:
         url: "{{ portainer_url }}/api/endpoints?limit=1000"
         method: GET
-        headers:
-          X-API-Key: "{{ portainer_api_token }}"
-        validate_certs: "{{ portainer_validate_certs | default(false) }}"
-        return_content: true
+        headers: { X-API-Key: "{{ portainer_api_token }}" }
+        validate_certs: "{{ portainer_validate_certs }}"
         status_code: 200
+        return_content: true
       register: _endpoints
 
     - name: Build endpoints maps/lists
       ansible.builtin.set_fact:
-        endpoints_map: "{{ dict( (_endpoints.json | map(attribute='Name') | list) | zip(_endpoints.json | map(attribute='Id') | list) ) }}"
-        endpoints_names: "{{ _endpoints.json | map(attribute='Name') | list }}"
+        endpoints_by_name: "{{ dict( (_endpoints.json | map(attribute='Name') | list) | zip(_endpoints.json | map(attribute='Id') | list) ) }}"
         endpoints_list: "{{ _endpoints.json | json_query('[].{Id: Id, Name: Name, URL: URL, PublicURL: PublicURL, Type: Type}') }}"
         endpoint_aliases_effective: "{{ endpoint_aliases_default | combine(endpoint_aliases | default({}), recursive=True) }}"
 
@@ -62,9 +70,14 @@
         var: endpoints_list
 
   tasks:
-    # Hacemos loop sobre include_tasks (válido); cada iteración resuelve endpoint y despliega
-    - name: Resolve endpoint and deploy stack (per item)
+    - name: Resolve endpoint and deploy (per stack)
       ansible.builtin.include_tasks: "tasks/resolve_portainer_endpoint_and_deploy.yml"
       loop: "{{ stacks }}"
       loop_control:
         loop_var: st
+      vars:
+        portainer_url: "{{ portainer_url }}"
+        portainer_api_token: "{{ portainer_api_token }}"
+        portainer_validate_certs: "{{ portainer_validate_certs }}"
+        endpoints_by_name: "{{ endpoints_by_name }}"
+        endpoint_aliases_effective: "{{ endpoint_aliases_effective }}"

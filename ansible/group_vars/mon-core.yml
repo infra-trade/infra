@@ -1,0 +1,77 @@
+# group_vars/mon-core.yml
+# Vars para 36_portainer_git_stacks.yml ejecutado contra el host mon-core
+
+# URL del Portainer Server (mon-core)
+portainer_url: "https://mon-core:9443"
+# En laboratorio suele ser false (cert self-signed). En prod => true con CA válida.
+portainer_validate_certs: false
+
+# NO pongas el token aquí si el repo es público.
+# El playbook toma PORTAINER_TOKEN del entorno. Si AÚN así quieres fijarlo:
+# portainer_token: "REEMPLAZA_CON_TU_TOKEN"
+
+# Mapeo de aliases -> nombres de endpoints en Portainer
+# Asegúrate de que estos nombres coincidan con los endpoints que ves en Portainer (Endpoints).
+endpoint_aliases:
+  mon: local
+  airflow: airflow-core
+  kafka: kafka-core
+  spark: spark-core
+  db: db-core
+
+# Stacks a crear/actualizar desde el repo Git
+# file_path es la ruta al docker-compose dentro del repo.
+# Si usas repo privado por SSH, cambia repo_url a git@github.com:ORG/infra.git
+stacks:
+  - name: mon
+    repo_url: "https://github.com/infra-trade/infra.git"
+    git_ref: "main"
+    file_path: "infra/mon/compose/docker-compose.yml"
+    endpoint: "mon"
+    prune: true
+    env: []
+
+  - name: db
+    repo_url: "https://github.com/infra-trade/infra.git"
+    git_ref: "main"
+    file_path: "infra/db/compose/docker-compose.yml"
+    endpoint: "db"
+    prune: true
+    env: []
+
+  - name: kafka
+    repo_url: "https://github.com/infra-trade/infra.git"
+    git_ref: "main"
+    file_path: "infra/kafka/compose/docker-compose.yml"
+    endpoint: "kafka"
+    prune: true
+    env: []
+
+  - name: spark
+    repo_url: "https://github.com/infra-trade/infra.git"
+    git_ref: "main"
+    file_path: "infra/spark/compose/docker-compose.yml"
+    endpoint: "spark"
+    prune: true
+    env: []
+
+  - name: airflow
+    repo_url: "https://github.com/infra-trade/infra.git"
+    git_ref: "main"
+    file_path: "infra/airflow/compose/docker-compose.yml"
+    endpoint: "airflow"
+    prune: true
+    env: []
+
+  # IBKR (elige mon-core o kafka-core como endpoint)
+  - name: ibkr
+    repo_url: "https://github.com/infra-trade/infra.git"
+    git_ref: "main"
+    file_path: "infra/ibkr/compose/docker-compose.yml"
+    endpoint: "mon"
+    prune: true
+    env:
+      # Recomiendo pasar estas por "Env Vars" en Portainer como secretos.
+      - { name: IBKR_USER, value: "REEMPLAZA" }
+      - { name: IBKR_PASS, value: "REEMPLAZA" }
+      # Si tu imagen usa otros nombres (p.ej. TWOFA / IBKR_QR), añádelos aquí.
