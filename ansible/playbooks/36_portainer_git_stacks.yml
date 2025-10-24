@@ -1,26 +1,21 @@
 ---
 # playbooks/36_portainer_git_stacks.yml
-# Crea/actualiza stacks en Portainer desde Git resolviendo endpointId de forma dinámica.
 
 - name: Create/Update Portainer stacks from Git (dynamic endpointId)
   hosts: mon-core
   become: false
   gather_facts: yes
 
-  vars:
-    # Token: exporta PORTAINER_TOKEN en el controlador
-    portainer_api_key: "{{ lookup('env', 'PORTAINER_TOKEN') | default('', true) }}"
-    # Variables esperadas en group_vars/all.yml:
-    # - portainer_url
-    # - portainer_validate_certs
-    # - stacks (lista)
-    # - endpoint_aliases (mapa)
-
+  # Carga explícita de group_vars, por si Ansible no los recoge automáticamente
   pre_tasks:
+    - name: Load group vars (all.yml) next to repo root
+      include_vars:
+        file: "{{ playbook_dir }}/../group_vars/all.yml"
+
     - name: Assert API token present
       assert:
         that:
-          - portainer_api_key | length > 0
+          - (lookup('env', 'PORTAINER_TOKEN') | default('', true)) | length > 0
         fail_msg: "PORTAINER_TOKEN no está definido (exporta PORTAINER_TOKEN en el controlador)."
         success_msg: All assertions passed
 
@@ -59,7 +54,7 @@
         url: "{{ portainer_url }}/api/system/status"
         method: GET
         headers:
-          X-API-Key: "{{ portainer_api_key }}"
+          X-API-Key: "{{ lookup('env', 'PORTAINER_TOKEN') }}"
         validate_certs: "{{ portainer_validate_certs | default(false) }}"
         follow_redirects: all
         status_code: 200
@@ -74,142 +69,3 @@
     - name: Show connectivity check result (safe)
       debug:
         msg: "Portainer system/status OK (200)."
-
-  tasks:
-    #####################################################################
-    # 1) Obtener endpoints y resolver endpointId por alias
-    #####################################################################
-    - name: Get endpoints list
-      uri:
-        url: "{{ portainer_url }}/api/endpoints?limit=1000"
-        method: GET
-        headers:
-          X-API-Key: "{{ portainer_api_key }}"
-        validate_certs: "{{ portainer_validate_certs | default(false) }}"
-        follow_redirects: all
-        return_content: true
-        status_code: 200
-      register: endpoints_resp
-      retries: 4
-      delay: 3
-      until: endpoints_resp.status is defined and endpoints_resp.status == 200
-
-    - name: Debug endpoints raw (ayuda diagnóstico)
-      debug:
-        var: endpoints_resp.json
-      when: endpoints_resp.json is defined
-
-    - name: Build alias->endpointId map from Portainer
-      set_fact:
-        endpoint_name_to_id: "{{ dict((endpoints_resp.json | default([])) | map(attribute='Name') | zip((endpoints_resp.json | default([])) | map(attribute='Id'))) }}"
-      changed_when: false
-
-    - name: Resolve endpointId for each stack using endpoint_aliases
-      set_fact:
-        stacks_final: >-
-          {{
-            stacks
-            | map('combine',
-                {
-                  'endpoint_name': (endpoint_aliases[item.endpoint] | default(item.endpoint))
-                }
-              )
-            | map('combine',
-                {
-                  'endpointId':
-                    (
-                      endpoint_name_to_id[endpoint_aliases[item.endpoint] | default(item.endpoint)]
-                      if (endpoint_name_to_id is defined and
-                          (endpoint_aliases[item.endpoint] | default(item.endpoint)) in endpoint_name_to_id)
-                      else omit
-                    )
-                }
-              )
-          }}
-      vars:
-        item: "{{ item }}"
-      loop: "{{ stacks }}"
-      changed_when: false
-      register: __sf
-
-    - name: Flatten resolved stacks
-      set_fact:
-        stacks_final: "{{ __sf.results | map(attribute='ansible_facts.stacks_final') | list | first }}"
-
-    - name: Fail if some stack has unresolved endpointId
-      vars:
-        unresolved: "{{ stacks_final | selectattr('endpointId', 'undefined') | list }}"
-      fail:
-        msg: >-
-          No se pudo resolver endpointId para algunos stacks:
-          {{ unresolved | map(attribute='name') | list }}.
-          Verifica que endpoint_aliases mapee a nombres EXACTOS de Portainer (endpoint.Name)
-          y que ese nombre aparezca en /api/endpoints.
-      when: (stacks_final | selectattr('endpointId', 'undefined') | list | length) > 0
-
-    #####################################################################
-    # 2) Upsert stacks desde Git (sin usar block+loop)
-    #####################################################################
-    - name: Get stack by name (lookup)
-      uri:
-        url: "{{ portainer_url }}/api/stacks?filters=%7B%22name%22:%5B%22{{ item.name | urlencode }}%22%5D%7D"
-        method: GET
-        headers:
-          X-API-Key: "{{ portainer_api_key }}"
-        validate_certs: "{{ portainer_validate_certs | default(false) }}"
-        follow_redirects: all
-        return_content: true
-        status_code: 200
-      register: stack_lookups
-      loop: "{{ stacks_final }}"
-      loop_control:
-        label: "{{ item.name }}"
-
-    - name: Update stack from Git if exists
-      vars:
-        existing: "{{ (item.json | selectattr('Name','equalto', item.item.name) | list | first) | default(None) }}"
-      uri:
-        url: "{{ portainer_url }}/api/stacks/{{ existing.Id }}"
-        method: PUT
-        headers:
-          X-API-Key: "{{ portainer_api_key }}"
-        validate_certs: "{{ portainer_validate_certs | default(false) }}"
-        follow_redirects: all
-        status_code: 200
-        body_format: json
-        body:
-          RepositoryURL: "{{ item.item.repo_url }}"
-          RepositoryReferenceName: "{{ item.item.git_ref | default('main') }}"
-          ComposeFilePathInRepository: "{{ item.item.compose_path }}"
-          EndpointID: "{{ item.item.endpointId | int }}"
-          Env: "{{ item.item.env | default([]) }}"
-          PullImage: true
-      when: existing is not none
-      loop: "{{ stack_lookups.results }}"
-      loop_control:
-        label: "{{ item.item.name }}"
-
-    - name: Create stack from Git if not exists
-      vars:
-        exists_count: "{{ (item.json | selectattr('Name','equalto', item.item.name) | list | length) | default(0) }}"
-      uri:
-        url: "{{ portainer_url }}/api/stacks/create?type=2&method=repository&endpointId={{ item.item.endpointId | int }}"
-        method: POST
-        headers:
-          X-API-Key: "{{ portainer_api_key }}"
-        validate_certs: "{{ portainer_validate_certs | default(false) }}"
-        follow_redirects: all
-        status_code: 200
-        body_format: json
-        body:
-          Name: "{{ item.item.name }}"
-          RepositoryURL: "{{ item.item.repo_url }}"
-          RepositoryReferenceName: "{{ item.item.git_ref | default('main') }}"
-          ComposeFilePathInRepository: "{{ item.item.compose_path }}"
-          SwarmID: ""
-          Env: "{{ item.item.env | default([]) }}"
-          Prune: true
-      when: exists_count | int == 0
-      loop: "{{ stack_lookups.results }}"
-      loop_control:
-        label: "{{ item.item.name }}"
