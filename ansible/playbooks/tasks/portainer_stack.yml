@@ -6,6 +6,7 @@
 # - st: { name, endpoint, repo_url, compose_path, git_ref, env: [ {name,value}, ... ] }
 # - endpoint_id (int) → ya resuelto por el task que incluye este archivo
 # - Variables de workspace (_git_base, _repo_dir, _compose_abs, _compose_dir, _dotenv_abs) predefinidas por el resolver
+# - prefer_host_ssh_key (bool, opcional): por defecto true → usa ~/.ssh/id_ed25519
 
 # ====== Preparación del workspace local ======
 - name: Definir carpetas locales (solo si no vienen predefinidas)
@@ -26,7 +27,7 @@
   delegate_to: localhost
   run_once: true
 
-# Preferir la clave del host (~/.ssh/id_ed25519) salvo que se pida explícitamente usar deploy key
+# ====== Preferir clave del host a menos que se pida lo contrario ======
 - name: Force using host SSH key (id_ed25519) unless told otherwise
   ansible.builtin.set_fact:
     _git_ssh_command: "ssh -i {{ lookup('env','HOME') }}/.ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
@@ -35,29 +36,54 @@
   run_once: true
 
 # ====== Clonado/actualización del repo (local) ======
-- name: Preparar GIT_SSH_COMMAND si hay deploy key en ruta
+- name: Preparar GIT_SSH_COMMAND si hay deploy key en ruta (y no se fuerza host key)
   ansible.builtin.set_fact:
     _git_ssh_command: >-
       {{ 'ssh -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -i ' ~ github_deploy_key_path
          if (github_deploy_key_path is defined and github_deploy_key_path|length>0)
          else omit }}
-  when: github_deploy_key_path is defined and github_deploy_key_path|length > 0
+  when: (github_deploy_key_path is defined and github_deploy_key_path|length > 0) and not (prefer_host_ssh_key | default(true) | bool)
   delegate_to: localhost
   run_once: true
 
-- name: Escribir deploy key a archivo temporal (si viene como contenido)
+- name: Escribir deploy key a archivo temporal (si viene como contenido y no se fuerza host key)
   ansible.builtin.copy:
     dest: "{{ _git_base }}/id_rsa"
     content: "{{ github_deploy_key }}"
     mode: "0600"
-  when: github_deploy_key is defined and github_deploy_key|length > 0
+  when: (github_deploy_key is defined and github_deploy_key|length > 0) and not (prefer_host_ssh_key | default(true) | bool)
   delegate_to: localhost
   run_once: true
 
-- name: Preparar GIT_SSH_COMMAND (si deploy key fue escrita)
+- name: Validate deploy key format (PEM OpenSSH)
+  ansible.builtin.assert:
+    that:
+      - github_deploy_key is search('^-----BEGIN OPENSSH PRIVATE KEY-----')
+  when: (github_deploy_key is defined and github_deploy_key|length > 0) and not (prefer_host_ssh_key | default(true) | bool)
+  delegate_to: localhost
+  run_once: true
+
+- name: Normalize CRLF in deploy key
+  ansible.builtin.replace:
+    path: "{{ _git_base }}/id_rsa"
+    regexp: '\r'
+    replace: ''
+  when: (github_deploy_key is defined and github_deploy_key|length > 0) and not (prefer_host_ssh_key | default(true) | bool)
+  delegate_to: localhost
+  run_once: true
+
+- name: Preparar GIT_SSH_COMMAND (si deploy key fue escrita y no se fuerza host key)
   ansible.builtin.set_fact:
     _git_ssh_command: "ssh -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -i {{ _git_base }}/id_rsa"
-  when: github_deploy_key is defined and github_deploy_key|length > 0
+  when: (github_deploy_key is defined and github_deploy_key|length > 0) and not (prefer_host_ssh_key | default(true) | bool)
+  delegate_to: localhost
+  run_once: true
+
+# Fallback: si por alguna razón aún no hay _git_ssh_command, usa la host key
+- name: Ensure _git_ssh_command is set (fallback to host key)
+  ansible.builtin.set_fact:
+    _git_ssh_command: "ssh -i {{ lookup('env','HOME') }}/.ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+  when: _git_ssh_command is not defined
   delegate_to: localhost
   run_once: true
 
@@ -68,18 +94,8 @@
     version: "{{ st.git_ref | default('main') }}"
     accept_hostkey: true
     update: true
-  environment: >-
-    {{
-      (
-        { 'GIT_SSH_COMMAND': _git_ssh_command }
-        if _git_ssh_command is defined
-        else {
-          'GIT_SSH_COMMAND':
-            'ssh -i ' ~ (lookup("env","HOME") ~ '/.ssh/id_ed25519') ~
-            ' -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new'
-        }
-      )
-    }}
+  environment:
+    GIT_SSH_COMMAND: "{{ _git_ssh_command }}"
   delegate_to: localhost
 
 # ====== Leer compose y .env, y normalizar Env ======
