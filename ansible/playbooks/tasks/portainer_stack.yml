@@ -26,6 +26,14 @@
   delegate_to: localhost
   run_once: true
 
+# Preferir la clave del host (~/.ssh/id_ed25519) salvo que se pida explícitamente usar deploy key
+- name: Force using host SSH key (id_ed25519) unless told otherwise
+  ansible.builtin.set_fact:
+    _git_ssh_command: "ssh -i {{ lookup('env','HOME') }}/.ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+  when: prefer_host_ssh_key | default(true) | bool
+  delegate_to: localhost
+  run_once: true
+
 # ====== Clonado/actualización del repo (local) ======
 - name: Preparar GIT_SSH_COMMAND si hay deploy key en ruta
   ansible.builtin.set_fact:
