@@ -1,77 +1,84 @@
-# group_vars/mon-core.yml
-# Vars para 36_portainer_git_stacks.yml ejecutado contra el host mon-core
+---
+- name: Create/Update Portainer stacks from Git (dynamic endpointId)
+  hosts: mon-core
+  gather_facts: false
 
-# URL del Portainer Server (mon-core)
-portainer_url: "https://mon-core:9443"
-# En laboratorio suele ser false (cert self-signed). En prod => true con CA válida.
-portainer_validate_certs: false
+  vars:
+    portainer_validate_certs: false
+    endpoint_aliases_default:
+      mon: local
+      airflow: airflow-core
+      kafka: kafka-core
+      spark: spark-core
+      db: db-core
+    portainer_api_token: "{{ lookup('env','PORTAINER_TOKEN') | default(portainer_token | default(''), true) }}"
+    # ❌ NO definir 'stacks' aquí. Lo trae group_vars o -e.
 
-# NO pongas el token aquí si el repo es público.
-# El playbook toma PORTAINER_TOKEN del entorno. Si AÚN así quieres fijarlo:
-# portainer_token: "REEMPLAZA_CON_TU_TOKEN"
+  pre_tasks:
+    - name: Build effective Portainer URL (avoid self-recursion)
+      set_fact:
+        portainer_url_effective: >-
+          {{ (portainer_url is defined and (portainer_url|string)|length > 0)
+             | ternary(portainer_url,
+                       'https://' ~ (hostvars[inventory_hostname].ansible_host | default(inventory_hostname)) ~ ':9443') }}
 
-# Mapeo de aliases -> nombres de endpoints en Portainer
-# Asegúrate de que estos nombres coincidan con los endpoints que ves en Portainer (Endpoints).
-endpoint_aliases:
-  mon: local
-  airflow: airflow-core
-  kafka: kafka-core
-  spark: spark-core
-  db: db-core
+    - name: Fail early if token missing
+      assert:
+        that: portainer_api_token | length > 0
+        fail_msg: "Falta API key. Exporta PORTAINER_TOKEN o define portainer_token en group_vars."
 
-# Stacks a crear/actualizar desde el repo Git
-# file_path es la ruta al docker-compose dentro del repo.
-# Si usas repo privado por SSH, cambia repo_url a git@github.com:ORG/infra.git
-stacks:
-  - name: mon
-    repo_url: "https://github.com/infra-trade/infra.git"
-    git_ref: "main"
-    file_path: "infra/mon/compose/docker-compose.yml"
-    endpoint: "mon"
-    prune: true
-    env: []
+    - name: Check Portainer is reachable
+      uri:
+        url: "{{ portainer_url_effective }}/api/system/status"
+        method: GET
+        headers: { X-API-Key: "{{ portainer_api_token }}" }
+        validate_certs: "{{ portainer_validate_certs }}"
+        status_code: 200
 
-  - name: db
-    repo_url: "https://github.com/infra-trade/infra.git"
-    git_ref: "main"
-    file_path: "infra/db/compose/docker-compose.yml"
-    endpoint: "db"
-    prune: true
-    env: []
+    - name: Fetch endpoints
+      uri:
+        url: "{{ portainer_url_effective }}/api/endpoints?limit=1000"
+        method: GET
+        headers: { X-API-Key: "{{ portainer_api_token }}" }
+        validate_certs: "{{ portainer_validate_certs }}"
+        status_code: 200
+        return_content: true
+      register: _endpoints
 
-  - name: kafka
-    repo_url: "https://github.com/infra-trade/infra.git"
-    git_ref: "main"
-    file_path: "infra/kafka/compose/docker-compose.yml"
-    endpoint: "kafka"
-    prune: true
-    env: []
+    - name: Build endpoints maps/lists
+      set_fact:
+        endpoints_by_name: "{{ dict( (_endpoints.json | map(attribute='Name') | list) | zip(_endpoints.json | map(attribute='Id') | list) ) }}"
+        endpoints_list: "{{ _endpoints.json | json_query('[].{Id: Id, Name: Name, URL: URL, PublicURL: PublicURL, Type: Type}') }}"
+        endpoint_aliases_effective: "{{ endpoint_aliases_default | combine(endpoint_aliases | default({}), recursive=True) }}"
 
-  - name: spark
-    repo_url: "https://github.com/infra-trade/infra.git"
-    git_ref: "main"
-    file_path: "infra/spark/compose/docker-compose.yml"
-    endpoint: "spark"
-    prune: true
-    env: []
+    - name: Load stacks (from group_vars or -e) into stacks_effective
+      set_fact:
+        stacks_effective: "{{ (stacks if (stacks is defined) else []) }}"
 
-  - name: airflow
-    repo_url: "https://github.com/infra-trade/infra.git"
-    git_ref: "main"
-    file_path: "infra/airflow/compose/docker-compose.yml"
-    endpoint: "airflow"
-    prune: true
-    env: []
+    - name: Assert stacks are provided
+      assert:
+        that:
+          - stacks_effective is defined
+          - stacks_effective | length > 0
+        fail_msg: >
+          No se encontró 'stacks'. Define stacks en group_vars/mon-core.yml (o pásalas con -e).
+          Ejemplo rápido:
+          ansible-playbook ... -e @group_vars/mon-core.yml
+          o -e 'stacks=[{name:\"mon\",repo_url:\"...\",file_path:\"...\",endpoint:\"mon\"}]'
 
-  # IBKR (elige mon-core o kafka-core como endpoint)
-  - name: ibkr
-    repo_url: "https://github.com/infra-trade/infra.git"
-    git_ref: "main"
-    file_path: "infra/ibkr/compose/docker-compose.yml"
-    endpoint: "mon"
-    prune: true
-    env:
-      # Recomiendo pasar estas por "Env Vars" en Portainer como secretos.
-      - { name: IBKR_USER, value: "REEMPLAZA" }
-      - { name: IBKR_PASS, value: "REEMPLAZA" }
-      # Si tu imagen usa otros nombres (p.ej. TWOFA / IBKR_QR), añádelos aquí.
+    - name: Show detected endpoints (audit)
+      debug:
+        var: endpoints_list
+
+  tasks:
+    - name: Resolve endpoint and deploy (per stack)
+      include_tasks: "tasks/resolve_portainer_endpoint_and_deploy.yml"
+      loop: "{{ stacks_effective }}"
+      loop_control:
+        loop_var: st
+      vars:
+        portainer_url: "{{ portainer_url_effective }}"
+        portainer_api_token: "{{ portainer_api_token }}"
+        portainer_validate_certs: "{{ portainer_validate_certs }}"
+        endpoints_by_name: "{{ endpoints_by_name }}"
+        endpoint_aliases_effective: "{{ endpoint_aliases_effective }}"
