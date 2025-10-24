@@ -1,4 +1,24 @@
-# ejemplo genérico (ajústalo por VM)
+version: "3.8"
 services:
-  hello:
-    image: hello-world
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: trader
+      POSTGRES_PASSWORD: traderpass
+      POSTGRES_DB: trading
+    volumes:
+      - /srv/iac/db/data:/var/lib/postgresql/data
+      - /srv/iac/db/init:/docker-entrypoint-initdb.d:ro
+    ports: ["5432:5432"]
+    restart: unless-stopped
+
+  pgadmin:
+    image: dpage/pgadmin4:8
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: adminpass
+    volumes:
+      - /srv/iac/db/pgadmin:/var/lib/pgadmin
+    ports: ["5050:80"]
+    depends_on: [postgres]
+    restart: unless-stopped
