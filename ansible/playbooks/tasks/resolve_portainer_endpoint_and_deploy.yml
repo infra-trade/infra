@@ -21,7 +21,7 @@
       {{ st.endpoint_id }}
       {%- elif st.endpoint is defined -%}
         {%- set e = st.endpoint -%}
-        {%- set alias = aliases_effective.get(e, e) -%}
+        {%- set alias = alias_map.get(e, e) -%}
         {{ endpoints_by_name.get(alias) | default(endpoints_by_name.get(e)) | default('') }}
       {%- else -%}
       {{ endpoints_by_name.get('local') | default('') }}
@@ -37,7 +37,8 @@
   ansible.builtin.uri:
     url: "{{ portainer_url }}/api/stacks"
     method: GET
-    headers: { X-API-Key: "{{ portainer_api_token }}" }
+    headers:
+      X-API-Key: "{{ portainer_api_token }}"
     validate_certs: "{{ portainer_validate_certs }}"
     status_code: 200
     return_content: true

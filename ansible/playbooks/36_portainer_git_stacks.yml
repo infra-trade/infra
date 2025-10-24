@@ -4,15 +4,19 @@
   gather_facts: false
 
   vars:
+    # Acepta certificados self-signed
     portainer_validate_certs: false
+
+    # Alias por defecto (puedes sobreescribir con endpoint_aliases en group_vars/mon-core.yml)
     endpoint_aliases_default:
       mon: local
       airflow: airflow-core
       kafka: kafka-core
       spark: spark-core
       db: db-core
+
+    # API token: primero PORTAINER_TOKEN (env), si no portainer_token (group_vars)
     portainer_api_token: "{{ lookup('env','PORTAINER_TOKEN') | default(portainer_token | default(''), true) }}"
-    # OJO: no definas 'stacks' aquí.
 
   pre_tasks:
     - name: Build effective Portainer URL (avoid self-recursion)
@@ -31,7 +35,8 @@
       ansible.builtin.uri:
         url: "{{ portainer_url_effective }}/api/system/status"
         method: GET
-        headers: { X-API-Key: "{{ portainer_api_token }}" }
+        headers:
+          X-API-Key: "{{ portainer_api_token }}"
         validate_certs: "{{ portainer_validate_certs }}"
         status_code: 200
 
@@ -39,7 +44,8 @@
       ansible.builtin.uri:
         url: "{{ portainer_url_effective }}/api/endpoints?limit=1000"
         method: GET
-        headers: { X-API-Key: "{{ portainer_api_token }}" }
+        headers:
+          X-API-Key: "{{ portainer_api_token }}"
         validate_certs: "{{ portainer_validate_certs }}"
         status_code: 200
         return_content: true
@@ -47,10 +53,11 @@
 
     - name: Build endpoints maps/lists
       ansible.builtin.set_fact:
-        endpoints_by_name: "{{ dict( (_endpoints.json | map(attribute='Name') | list) | zip(_endpoints.json | map(attribute='Id') | list) ) }}"
+        endpoints_by_name: "{{ dict( (_endpoints.json | map(attribute='Name') | list)
+                             | zip(_endpoints.json | map(attribute='Id') | list) ) }}"
         endpoints_list: "{{ _endpoints.json | json_query('[].{Id: Id, Name: Name, URL: URL, PublicURL: PublicURL, Type: Type}') }}"
-        # 👇 usamos un nombre que no exista en tu inventario
-        aliases_effective: "{{ endpoint_aliases_default | combine(endpoint_aliases | default({}), recursive=True) }}"
+        # nombre interno para evitar colisiones con group_vars
+        __alias_map: "{{ endpoint_aliases_default | combine(endpoint_aliases | default({}), recursive=True) }}"
 
     - name: Load stacks (from group_vars or -e) into stacks_effective
       ansible.builtin.set_fact:
@@ -77,5 +84,4 @@
         portainer_api_token: "{{ portainer_api_token }}"
         portainer_validate_certs: "{{ portainer_validate_certs }}"
         endpoints_by_name: "{{ endpoints_by_name }}"
-        # 👇 pasamos aliases_effective en lugar del viejo nombre
-        aliases_effective: "{{ aliases_effective }}"
+        alias_map: "{{ __alias_map }}"
