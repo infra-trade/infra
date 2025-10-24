@@ -1,4 +1,16 @@
-# ejemplo genérico (ajústalo por VM)
+version: "3.8"
 services:
-  hello:
-    image: hello-world
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    volumes:
+      - /srv/iac/monitor/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["9090:9090"]
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=adminpass
+    ports: ["3000:3000"]
+    restart: unless-stopped
