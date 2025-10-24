@@ -4,7 +4,7 @@ services:
     image: postgres:16
     environment:
       POSTGRES_USER: trader
-      POSTGRES_PASSWORD: traderpass
+      POSTGRES_PASSWORD: S0p0rt3..
       POSTGRES_DB: trading
     volumes:
       - /srv/iac/db/data:/var/lib/postgresql/data
@@ -16,7 +16,7 @@ services:
     image: dpage/pgadmin4:8
     environment:
       PGADMIN_DEFAULT_EMAIL: admin@example.com
-      PGADMIN_DEFAULT_PASSWORD: adminpass
+      PGADMIN_DEFAULT_PASSWORD: S0p0rt3..
     volumes:
       - /srv/iac/db/pgadmin:/var/lib/pgadmin
     ports: ["5050:80"]
