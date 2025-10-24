@@ -1,6 +1,6 @@
 ---
 # playbooks/36_portainer_git_stacks.yml
-# Crea/actualiza stacks en Portainer desde Git resolviendo endpointId de forma dinámica.
+# Crea/actualiza stacks en Portainer desde Git usando alias -> endpointId dinámico.
 
 - name: Create/Update Portainer stacks from Git (dynamic endpointId)
   hosts: mon-core
@@ -8,13 +8,10 @@
   gather_facts: yes
 
   vars:
-    # Token: exporta PORTAINER_TOKEN en el controlador
+    # Lee token desde ENV (recomendado) o desde un var seguro/vault si lo defines aparte
     portainer_api_key: "{{ lookup('env', 'PORTAINER_TOKEN') | default('', true) }}"
-    # Variables esperadas en group_vars/all.yml:
-    # - portainer_url
-    # - portainer_validate_certs
-    # - stacks (lista)
-    # - endpoint_aliases (mapa)
+    # De group_vars/all.yml:
+    # portainer_url, portainer_validate_certs, stacks, endpoint_aliases
 
   pre_tasks:
     - name: Assert API token present
@@ -77,7 +74,7 @@
 
   tasks:
     #####################################################################
-    # 1) Obtener endpoints y resolver endpointId por alias
+    # 1) Obtener endpoints (dejamos visible para ver el error real)
     #####################################################################
     - name: Get endpoints list
       uri:
@@ -94,122 +91,159 @@
       delay: 3
       until: endpoints_resp.status is defined and endpoints_resp.status == 200
 
-    - name: Debug endpoints raw (ayuda diagnóstico)
+    - name: Debug endpoints raw (ayuda a diagnosticar si falla)
       debug:
         var: endpoints_resp.json
       when: endpoints_resp.json is defined
 
     - name: Build alias->endpointId map from Portainer
       set_fact:
-        endpoint_name_to_id: "{{ dict((endpoints_resp.json | default([])) | map(attribute='Name') | zip((endpoints_resp.json | default([])) | map(attribute='Id'))) }}"
+        endpoint_name_to_id: >-
+          {{
+            dict(
+              (endpoints_resp.json | default([]))
+              | selectattr('Name', 'defined')
+              | selectattr('Id', 'defined')
+              | map('extract', attribute=None)
+              | map('combine', [{'k': item.Name, 'v': item.Id}] ) | list
+            )
+          }}
+      vars:
+        # pequeño truco para poder usar map('combine'): construimos pares k/v
+        item: "{{ item }}"
+      loop: "{{ endpoints_resp.json | default([]) }}"
+      loop_control:
+        label: "{{ item.Name | default('unknown') }}"
+      when: endpoints_resp.json is defined
+      register: __tmp_ep_map
+      changed_when: false
+
+    - name: Collapse map result
+      set_fact:
+        endpoint_name_to_id: "{{ dict( __tmp_ep_map.results | map(attribute='ansible_facts.endpoint_name_to_id') | select('defined') | map('items') | sum(start=[]) ) }}"
+      when: __tmp_ep_map is defined
       changed_when: false
 
     - name: Resolve endpointId for each stack using endpoint_aliases
       set_fact:
-        stacks_final: >-
+        stacks_resolved: >-
           {{
-            stacks
-            | map('combine',
-                {
-                  'endpoint_name': (endpoint_aliases[item.endpoint] | default(item.endpoint))
-                }
-              )
-            | map('combine',
-                {
-                  'endpointId':
-                    (
-                      endpoint_name_to_id[endpoint_aliases[item.endpoint] | default(item.endpoint)]
-                      if (endpoint_name_to_id is defined and
-                          (endpoint_aliases[item.endpoint] | default(item.endpoint)) in endpoint_name_to_id)
-                      else omit
-                    )
-                }
-              )
+            stacks | map('combine',
+              {
+                'endpointId':
+                  (
+                    endpoint_name_to_id[
+                      endpoint_aliases[item.endpoint] | default(item.endpoint)
+                    ]
+                    if (endpoint_name_to_id is defined and
+                        (endpoint_aliases[item.endpoint] | default(item.endpoint)) in endpoint_name_to_id)
+                    else omit
+                  ),
+                'endpoint_name':
+                  endpoint_aliases[item.endpoint] | default(item.endpoint)
+              }
+            )
           }}
       vars:
         item: "{{ item }}"
       loop: "{{ stacks }}"
+      register: stacks_with_endpoints
       changed_when: false
-      register: __sf
-
-    - name: Flatten resolved stacks
-      set_fact:
-        stacks_final: "{{ __sf.results | map(attribute='ansible_facts.stacks_final') | list | first }}"
 
     - name: Fail if some stack has unresolved endpointId
       vars:
-        unresolved: "{{ stacks_final | selectattr('endpointId', 'undefined') | list }}"
+        unresolved: >-
+          {{
+            (stacks_with_endpoints.results | map(attribute='ansible_facts.stacks_resolved') | list | first)
+            | selectattr('endpointId', 'undefined')
+            | list
+          }}
       fail:
         msg: >-
           No se pudo resolver endpointId para algunos stacks:
           {{ unresolved | map(attribute='name') | list }}.
           Verifica que endpoint_aliases mapee a nombres EXACTOS de Portainer (endpoint.Name)
           y que ese nombre aparezca en /api/endpoints.
-      when: (stacks_final | selectattr('endpointId', 'undefined') | list | length) > 0
+      when: >-
+        ((stacks_with_endpoints.results | map(attribute='ansible_facts.stacks_resolved') | list | first)
+        | selectattr('endpointId', 'undefined') | list | length) > 0
+
+    - name: Set final stack list
+      set_fact:
+        stacks_final: "{{ (stacks_with_endpoints.results | map(attribute='ansible_facts.stacks_resolved') | list | first) }}"
 
     #####################################################################
-    # 2) Upsert stacks desde Git (sin usar block+loop)
+    # 2) Crear/actualizar stacks desde Git
     #####################################################################
-    - name: Get stack by name (lookup)
-      uri:
-        url: "{{ portainer_url }}/api/stacks?filters=%7B%22name%22:%5B%22{{ item.name | urlencode }}%22%5D%7D"
-        method: GET
-        headers:
-          X-API-Key: "{{ portainer_api_key }}"
-        validate_certs: "{{ portainer_validate_certs | default(false) }}"
-        follow_redirects: all
-        return_content: true
-        status_code: 200
-      register: stack_lookups
+    - name: Upsert stack from Git (create or update)
+      vars:
+        endpoint_id: "{{ item.endpointId }}"
+        repo_url: "{{ item.repo_url }}"
+        repo_ref: "{{ item.git_ref | default('main') }}"
+        compose_path: "{{ item.compose_path }}"
+        stack_name: "{{ item.name }}"
+        env_vars: "{{ item.env | default([]) }}"
+      block:
+        # Intentar UPDATE primero (si existe el stack)
+        - name: Get stack by name
+          uri:
+            url: "{{ portainer_url }}/api/stacks?filters=%7B%22name%22:%5B%22{{ stack_name | urlencode }}%22%5D%7D"
+            method: GET
+            headers:
+              X-API-Key: "{{ portainer_api_key }}"
+            validate_certs: "{{ portainer_validate_certs | default(false) }}"
+            follow_redirects: all
+            return_content: true
+            status_code: 200
+          register: stack_lookup
+
+        - name: Decide create or update
+          set_fact:
+            __existing_stack: "{{ (stack_lookup.json | selectattr('Name','equalto', stack_name) | list | first) | default(None) }}"
+            __env_dict: "{{ dict(env_vars | map(attribute='name') | list | zip(env_vars | map(attribute='value') | list)) }}"
+
+        - name: Update stack from Git if exists
+          when: __existing_stack is not none
+          uri:
+            url: "{{ portainer_url }}/api/stacks/{{ __existing_stack.Id }}"
+            method: PUT
+            headers:
+              X-API-Key: "{{ portainer_api_key }}"
+            validate_certs: "{{ portainer_validate_certs | default(false) }}"
+            follow_redirects: all
+            status_code: 200
+            body_format: json
+            body:
+              # Repositorio Git
+              RepositoryURL: "{{ repo_url }}"
+              RepositoryReferenceName: "{{ repo_ref }}"
+              ComposeFilePathInRepository: "{{ compose_path }}"
+              # Endpoint al que está ligado el stack
+              EndpointID: "{{ endpoint_id | int }}"
+              # Variables de entorno
+              Env: "{{ env_vars | default([]) }}"
+              # Forzar pull de repo
+              PullImage: true
+
+        - name: Create stack from Git if not exists
+          when: __existing_stack is none
+          uri:
+            url: "{{ portainer_url }}/api/stacks/create?type=2&method=repository&endpointId={{ endpoint_id | int }}"
+            method: POST
+            headers:
+              X-API-Key: "{{ portainer_api_key }}"
+            validate_certs: "{{ portainer_validate_certs | default(false) }}"
+            follow_redirects: all
+            status_code: 200
+            body_format: json
+            body:
+              Name: "{{ stack_name }}"
+              RepositoryURL: "{{ repo_url }}"
+              RepositoryReferenceName: "{{ repo_ref }}"
+              ComposeFilePathInRepository: "{{ compose_path }}"
+              SwarmID: ""
+              Env: "{{ env_vars | default([]) }}"
+              Prune: true
       loop: "{{ stacks_final }}"
       loop_control:
         label: "{{ item.name }}"
-
-    - name: Update stack from Git if exists
-      vars:
-        existing: "{{ (item.json | selectattr('Name','equalto', item.item.name) | list | first) | default(None) }}"
-      uri:
-        url: "{{ portainer_url }}/api/stacks/{{ existing.Id }}"
-        method: PUT
-        headers:
-          X-API-Key: "{{ portainer_api_key }}"
-        validate_certs: "{{ portainer_validate_certs | default(false) }}"
-        follow_redirects: all
-        status_code: 200
-        body_format: json
-        body:
-          RepositoryURL: "{{ item.item.repo_url }}"
-          RepositoryReferenceName: "{{ item.item.git_ref | default('main') }}"
-          ComposeFilePathInRepository: "{{ item.item.compose_path }}"
-          EndpointID: "{{ item.item.endpointId | int }}"
-          Env: "{{ item.item.env | default([]) }}"
-          PullImage: true
-      when: existing is not none
-      loop: "{{ stack_lookups.results }}"
-      loop_control:
-        label: "{{ item.item.name }}"
-
-    - name: Create stack from Git if not exists
-      vars:
-        exists_count: "{{ (item.json | selectattr('Name','equalto', item.item.name) | list | length) | default(0) }}"
-      uri:
-        url: "{{ portainer_url }}/api/stacks/create?type=2&method=repository&endpointId={{ item.item.endpointId | int }}"
-        method: POST
-        headers:
-          X-API-Key: "{{ portainer_api_key }}"
-        validate_certs: "{{ portainer_validate_certs | default(false) }}"
-        follow_redirects: all
-        status_code: 200
-        body_format: json
-        body:
-          Name: "{{ item.item.name }}"
-          RepositoryURL: "{{ item.item.repo_url }}"
-          RepositoryReferenceName: "{{ item.item.git_ref | default('main') }}"
-          ComposeFilePathInRepository: "{{ item.item.compose_path }}"
-          SwarmID: ""
-          Env: "{{ item.item.env | default([]) }}"
-          Prune: true
-      when: exists_count | int == 0
-      loop: "{{ stack_lookups.results }}"
-      loop_control:
-        label: "{{ item.item.name }}"
