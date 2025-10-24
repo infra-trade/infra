@@ -4,17 +4,19 @@
 # - portainer_api_token (API Key)
 # - portainer_validate_certs (bool)
 # - st: { name, endpoint, repo_url, compose_path, git_ref, env: [ {name,value}, ... ] }
-# - endpoint_id (int) → ya resuelto por el play que incluye esta tarea
+# - endpoint_id (int) → ya resuelto por el task que incluye este archivo
+# - Variables de workspace (_git_base, _repo_dir, _compose_abs, _compose_dir, _dotenv_abs) predefinidas por el resolver
 
 # ====== Preparación del workspace local ======
-- name: Definir carpetas locales
+- name: Definir carpetas locales (solo si no vienen predefinidas)
   ansible.builtin.set_fact:
-    _git_base: "{{ lookup('env','HOME') ~ '/.cache/portainer-stacks' }}"
-    _repo_dir: "{{ lookup('env','HOME') ~ '/.cache/portainer-stacks/' ~ (st.repo_url | regex_replace('[^A-Za-z0-9_.-]','_')) ~ '_' ~ (st.git_ref | default('main')) }}"
-    _compose_rel: "{{ st.compose_path }}"
-    _compose_abs: "{{ _repo_dir ~ '/' ~ st.compose_path }}"
-    _compose_dir: "{{ (_repo_dir ~ '/' ~ st.compose_path) | dirname }}"
-    _dotenv_abs: "{{ (_repo_dir ~ '/' ~ st.compose_path) | dirname ~ '/.env' }}"
+    _git_base: "{{ _git_base | default(lookup('env','HOME') ~ '/.cache/portainer-stacks') }}"
+    _repo_dir: "{{ _repo_dir | default( lookup('env','HOME') ~ '/.cache/portainer-stacks/' ~ (st.repo_url | regex_replace('[^A-Za-z0-9_.-]','_')) ~ '_' ~ (st.git_ref | default('main')) ) }}"
+    _compose_rel: "{{ _compose_rel | default(st.compose_path) }}"
+    _compose_abs: "{{ _compose_abs | default(_repo_dir ~ '/' ~ st.compose_path) }}"
+    _compose_dir: "{{ _compose_dir | default((_repo_dir ~ '/' ~ st.compose_path) | dirname) }}"
+    _dotenv_abs: "{{ _dotenv_abs | default((_repo_dir ~ '/' ~ st.compose_path) | dirname ~ '/.env') }}"
+  when: _repo_dir is not defined
 
 - name: Crear base de trabajo local
   ansible.builtin.file:
@@ -25,7 +27,7 @@
   run_once: true
 
 # ====== Clonado/actualización del repo (local) ======
-- name: Preparar GIT_SSH_COMMAND si hay deploy key inline
+- name: Preparar GIT_SSH_COMMAND si hay deploy key en ruta
   ansible.builtin.set_fact:
     _git_ssh_command: >-
       {{ 'ssh -o StrictHostKeyChecking=accept-new -i ' ~ github_deploy_key_path
@@ -138,7 +140,7 @@
       }}
   delegate_to: localhost
 
-# ====== Sanitizar compose: remover env_file ======
+# ====== Sanitizar compose: remover env_file (para no depender del archivo) ======
 - name: Remover env_file (línea simple)
   ansible.builtin.set_fact:
     _compose_text: "{{ _compose_text | regex_replace('(?m)^\\s*env_file\\s*:\\s*\\.env\\s*$', '') }}"
@@ -159,7 +161,8 @@
   ansible.builtin.uri:
     url: "{{ portainer_url }}/api/stacks?filters={{ {'EndpointId': endpoint_id} | to_json | urlencode }}"
     method: GET
-    headers: { X-API-Key: "{{ portainer_api_token }}" }
+    headers:
+      X-API-Key: "{{ portainer_api_token }}"
     validate_certs: "{{ portainer_validate_certs | default(false) }}"
     return_content: true
     status_code: 200

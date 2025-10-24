@@ -1,7 +1,7 @@
 ---
 # Recibe: st (stack item), endpoints_map, endpoint_aliases_effective, endpoints_names
-# También hereda: portainer_url, portainer_api_token, portainer_validate_certs
-# Resultado: set_fact endpoint_id y resolved_endpoint_name; luego incluye tasks/portainer_stack.yml
+# Hereda: portainer_url, portainer_api_token, portainer_validate_certs
+# Resultado: set_fact endpoint_id y resolved_endpoint_name; prepara workspace local; incluye tasks/portainer_stack.yml
 
 - name: Prepare raw endpoint name
   ansible.builtin.set_fact:
@@ -50,6 +50,21 @@
       Available endpoints: {{ endpoints_names }}
       Define 'endpoint_aliases' in group_vars or use the exact endpoint name.
   when: endpoint_id is not defined
+
+# === PREDEFINE workspace local para evitar variables indefinidas en el include siguiente ===
+- name: Prepare local workspace vars for this stack
+  ansible.builtin.set_fact:
+    _git_base: "{{ lookup('env','HOME') ~ '/.cache/portainer-stacks' }}"
+    _repo_dir: >-
+      {{
+        lookup('env','HOME') ~ '/.cache/portainer-stacks/' ~
+        (st.repo_url | regex_replace('[^A-Za-z0-9_.-]', '_')) ~ '_' ~
+        (st.git_ref | default('main'))
+      }}
+    _compose_rel: "{{ st.compose_path }}"
+    _compose_abs: "{{ (lookup('env','HOME') ~ '/.cache/portainer-stacks/' ~ (st.repo_url | regex_replace('[^A-Za-z0-9_.-]', '_')) ~ '_' ~ (st.git_ref | default('main'))) ~ '/' ~ st.compose_path }}"
+    _compose_dir: "{{ ((lookup('env','HOME') ~ '/.cache/portainer-stacks/' ~ (st.repo_url | regex_replace('[^A-Za-z0-9_.-]', '_')) ~ '_' ~ (st.git_ref | default('main'))) ~ '/' ~ st.compose_path) | dirname }}"
+    _dotenv_abs: "{{ (((lookup('env','HOME') ~ '/.cache/portainer-stacks/' ~ (st.repo_url | regex_replace('[^A-Za-z0-9_.-]', '_')) ~ '_' ~ (st.git_ref | default('main'))) ~ '/' ~ st.compose_path) | dirname) ~ '/.env' }}"
 
 # Deploy/update the stack using the resolved endpoint_id
 - name: Include tasks/portainer_stack.yml
