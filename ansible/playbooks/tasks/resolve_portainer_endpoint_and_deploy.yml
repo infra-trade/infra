@@ -1,10 +1,17 @@
 ---
+# Normaliza campos antes de validar
+- name: Normalize fields for stack {{ st.name }}
+  ansible.builtin.set_fact:
+    _file_path: "{{ st.file_path | default(st.compose_path | default('')) }}"
+    _git_ref: "{{ st.git_ref | default('main') }}"
+    _env_vars: "{{ st.env | default([]) }}"
+
 - name: Validate required fields for stack {{ st.name }}
   ansible.builtin.assert:
     that:
       - st.name is defined
       - st.repo_url is defined
-      - st.file_path is defined
+      - _file_path | length > 0
     fail_msg: "Faltan campos en stack {{ st | to_nice_json }}"
 
 - name: Resolve endpointId for {{ st.name }}
@@ -25,6 +32,7 @@
     that: _endpoint_id_resolved | string | length > 0
     fail_msg: "No se pudo resolver endpointId para stack {{ st.name }} (endpoint='{{ st.endpoint | default('') }}')."
 
+# ----- Buscar stack existente -----
 - name: Fetch stacks list
   ansible.builtin.uri:
     url: "{{ portainer_url }}/api/stacks"
@@ -40,6 +48,7 @@
     _existing_stack: "{{ (_stacks.json | selectattr('Name','equalto', st.name) | list | first) | default(None) }}"
     _existing_stack_id: "{{ ((_stacks.json | selectattr('Name','equalto', st.name) | list | first).Id) | default(None) }}"
 
+# ----- Crear si no existe -----
 - name: Create stack {{ st.name }} from repository (compose/standalone)
   when: _existing_stack_id is not defined
   ansible.builtin.uri:
@@ -54,14 +63,15 @@
     body:
       Name: "{{ st.name }}"
       RepositoryURL: "{{ st.repo_url }}"
-      RepositoryReferenceName: "{{ st.git_ref | default('main') }}"
-      ComposeFilePathInRepository: "{{ st.file_path }}"
-      Env: "{{ st.env | default([]) }}"
+      RepositoryReferenceName: "{{ _git_ref }}"
+      ComposeFilePathInRepository: "{{ _file_path }}"
+      Env: "{{ _env_vars }}"
       Prune: "{{ st.prune | default(true) }}"
   register: _create
 
-- name: Update git reference (optional) on existing stack {{ st.name }}
-  when: _existing_stack_id is defined and (st.git_ref is defined or st.file_path is defined)
+# ----- Update + redeploy si existe -----
+- name: Update git reference / file path (optional) on existing stack {{ st.name }}
+  when: _existing_stack_id is defined and (_git_ref is defined or _file_path is defined)
   ansible.builtin.uri:
     url: "{{ portainer_url }}/api/stacks/{{ _existing_stack_id }}"
     method: PUT
@@ -72,8 +82,8 @@
     status_code: 200
     body_format: json
     body:
-      RepositoryReferenceName: "{{ st.git_ref | default(omit) }}"
-      ComposeFilePathInRepository: "{{ st.file_path | default(omit) }}"
+      RepositoryReferenceName: "{{ _git_ref }}"
+      ComposeFilePathInRepository: "{{ _file_path }}"
   register: _update
   failed_when: false
 
@@ -91,5 +101,5 @@
     body:
       Prune: "{{ st.prune | default(true) }}"
       PullImage: true
-      Env: "{{ st.env | default([]) }}"
+      Env: "{{ _env_vars }}"
   register: _redeploy
