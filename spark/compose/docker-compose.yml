@@ -1,4 +1,18 @@
-# ejemplo genérico (ajústalo por VM)
+version: "3.8"
 services:
-  hello:
-    image: hello-world
+  spark-master:
+    image: bitnami/spark:3.5
+    environment: [SPARK_MODE=master]
+    volumes:
+      - /srv/iac/spark/jobs:/opt/spark/jobs:ro
+      - /srv/iac/spark/conf:/opt/bitnami/spark/conf
+    ports: ["7077:7077","8080:8080"]
+    restart: unless-stopped
+
+  spark-worker:
+    image: bitnami/spark:3.5
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+    depends_on: [spark-master]
+    restart: unless-stopped
