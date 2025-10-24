@@ -182,7 +182,8 @@
 # ====== Portainer: buscar stack existente por Name+EndpointId ======
 - name: Listar stacks en Portainer
   ansible.builtin.uri:
-    url: "{{ portainer_url }}/api/stacks?filters={{ {'EndpointId': (endpoint_id | int)} | to_json | urlencode }}""
+    # EndpointId como entero (FIX al 400 invalid filters)
+    url: "{{ portainer_url }}/api/stacks?filters={{ {'EndpointId': (endpoint_id | int)} | to_json | urlencode }}"
     method: GET
     headers:
       X-API-Key: "{{ portainer_api_token }}"
