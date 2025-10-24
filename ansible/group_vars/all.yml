@@ -1,10 +1,17 @@
+# =========================
 # group_vars/all.yml
+# =========================
+
+# --- Portainer (endpoint y validación TLS) ---
 portainer_url: "https://10.20.0.12:9443"
 portainer_validate_certs: false
+# Nota: NO guardar portainer_token aquí en texto plano.
+# Usa variable de entorno PORTAINER_TOKEN o cifra con ansible-vault en otro archivo.
 
+# --- Stacks desplegados desde Git (Portainer) ---
 stacks:
   - name: mon
-    endpoint: mon          # ← NOMBRE exacto del endpoint en Portainer
+    endpoint: mon
     repo_url: "git@github.com:infra-trade/infra.git"
     compose_path: "mon/compose/docker-compose.yml"
     git_ref: "main"
@@ -21,9 +28,50 @@ stacks:
       - { name: PUID, value: "50000" }
       - { name: PG_HOST, value: "db-core" }
 
+# --- Alias de endpoints (resolución dinámica en 36_portainer_git_stacks.yml) ---
 endpoint_aliases:
   mon: local
   airflow: airflow-core
   kafka: kafka-core
   spark: spark-core
   db: db-core
+
+# =====================================================================
+# NUEVO: Parámetros globales para sync, prechecks, atomic deploy y pin
+# =====================================================================
+
+# Ruta base del repo IaC en el controlador (ajusta a tu realidad)
+iac_root: "/home/ansible/IaC"
+
+# Prefiere rsync sobre copy (requerido para --delete confiable)
+prefer_rsync: true
+
+# Política de borrado por stack (controla rsync --delete)
+delete_policy:
+  airflow_dags: true        # recomendado: true para evitar DAGs huérfanos
+  airflow_plugins: false
+  kafka_config: true
+  kafka_scripts: false
+  spark_jobs: true
+  spark_conf: true
+
+# Archivos de exclusiones (para --delete) — crea estos paths en tu repo
+airflow_dags_exclude_file: "{{ iac_root }}/excludes/airflow_dags.exclude"
+spark_jobs_exclude_file:   "{{ iac_root }}/excludes/spark_jobs.exclude"
+kafka_conf_exclude_file:   "{{ iac_root }}/excludes/kafka_conf.exclude"
+
+# Prechecks antes de sincronizar artefactos
+precheck:
+  enable: true
+  airflow_cmd: "airflow"          # o ruta absoluta si aplica (/usr/local/bin/airflow)
+  spark_submit_cmd: "spark-submit"
+  python_bin: "python3"           # para ruff/flake8/pytest
+
+# Despliegue atómico para Airflow DAGs (releases + symlink 'current')
+atomic_deploy:
+  enable: true
+  keep_releases: 5
+
+# Version pinning para Portainer CE y Agent (usadas en 30_docker_portainer_all.yml)
+portainer_image: "portainer/portainer-ce:2.21.5"
+agent_image:     "portainer/agent:2.21.5"

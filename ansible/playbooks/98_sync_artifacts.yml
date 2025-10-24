@@ -1,315 +1,91 @@
 ---
-- name: Sync de artefactos (DAGs Airflow, configs Kafka, jobs Spark)
-  hosts: "{{ targets | default(sync_target_group | default('all')) }}"
-  become: true
+dest: "{{ sync_map.spark.dest_jobs }}/"
+mode: "0644"
+when:
+- sync_map.spark is defined
+- (not prefer_rsync | bool)
+- st_spark_jobs is defined and st_spark_jobs.stat.exists
 
-  vars:
-    # Si no están en group_vars, puedes definirlos aquí también
-    iac_root: "/home/ansible/IaC"
-    prefer_rsync: true
 
-  pre_tasks:
-    - name: Mostrar grupo/hosts destino
-      ansible.builtin.debug:
-        msg: "Destino: {{ ansible_play_hosts_all }}"
+- name: Sync Spark conf (rsync)
+ansible.posix.synchronize:
+src: "{{ sync_map.spark.src_conf }}/"
+dest: "{{ sync_map.spark.dest_conf }}/"
+recursive: true
+delete: "{{ delete_policy.spark_conf | default(false) }}"
+delegate_to: localhost
+when:
+- sync_map.spark is defined
+- prefer_rsync | bool
+- st_spark_conf is defined and st_spark_conf.stat.exists
 
-    - name: Asegurar rsync si prefer_rsync=true (solo Debian/Ubuntu)
-      ansible.builtin.package:
-        name: rsync
-        state: present
-      when: prefer_rsync | bool
-      ignore_errors: true
 
-    # ====== STAT de rutas locales (en el controlador) ======
-    - name: Stat Airflow DAGs (local)
-      ansible.builtin.stat:
-        path: "{{ sync_map.airflow.src_dags | default('') }}"
-      register: st_airflow_dags
-      delegate_to: localhost
-      run_once: true
-      when: sync_map.airflow is defined and (sync_map.airflow.src_dags | default('')) != ''
+- name: Sync Spark conf (fallback copy)
+ansible.builtin.copy:
+src: "{{ sync_map.spark.src_conf }}/"
+dest: "{{ sync_map.spark.dest_conf }}/"
+mode: "0644"
+when:
+- sync_map.spark is defined
+- (not prefer_rsync | bool)
+- st_spark_conf is defined and st_spark_conf.stat.exists
 
-    - name: Stat Airflow plugins (local)
-      ansible.builtin.stat:
-        path: "{{ sync_map.airflow.src_plugins | default('') }}"
-      register: st_airflow_plugins
-      delegate_to: localhost
-      run_once: true
-      when: sync_map.airflow is defined and (sync_map.airflow.src_plugins | default('')) != ''
 
-    - name: Stat Kafka config (local)
-      ansible.builtin.stat:
-        path: "{{ sync_map.kafka.src_config | default('') }}"
-      register: st_kafka_config
-      delegate_to: localhost
-      run_once: true
-      when: sync_map.kafka is defined and (sync_map.kafka.src_config | default('')) != ''
+post_tasks:
+- name: Listado final de destinos
+ansible.builtin.shell: |
+set -e
+echo "AIRFLOW DAGS:"; ls -la {{ sync_map.airflow.dest_dags | default('/dev/null') }} || true
+echo "AIRFLOW plugins:"; ls -la {{ sync_map.airflow.dest_plugins | default('/dev/null') }} || true
+echo "KAFKA config:"; ls -la {{ sync_map.kafka.dest_config | default('/dev/null') }} || true
+echo "KAFKA scripts:"; ls -la {{ sync_map.kafka.dest_scripts | default('/dev/null') }} || true
+echo "SPARK jobs:"; ls -la {{ sync_map.spark.dest_jobs | default('/dev/null') }} || true
+echo "SPARK conf:"; ls -la {{ sync_map.spark.dest_conf | default('/dev/null') }} || true
+args:
+executable: /bin/bash
+register: listout
+changed_when: false
 
-    - name: Stat Kafka scripts (local)
-      ansible.builtin.stat:
-        path: "{{ sync_map.kafka.src_scripts | default('') }}"
-      register: st_kafka_scripts
-      delegate_to: localhost
-      run_once: true
-      when: sync_map.kafka is defined and (sync_map.kafka.src_scripts | default('')) != ''
 
-    - name: Stat Spark jobs (local)
-      ansible.builtin.stat:
-        path: "{{ sync_map.spark.src_jobs | default('') }}"
-      register: st_spark_jobs
-      delegate_to: localhost
-      run_once: true
-      when: sync_map.spark is defined and (sync_map.spark.src_jobs | default('')) != ''
+- ansible.builtin.debug:
+var: listout.stdout_lines
 
-    - name: Stat Spark conf (local)
-      ansible.builtin.stat:
-        path: "{{ sync_map.spark.src_conf | default('') }}"
-      register: st_spark_conf
-      delegate_to: localhost
-      run_once: true
-      when: sync_map.spark is defined and (sync_map.spark.src_conf | default('')) != ''
-
-    # ====== Crear árboles destino ======
-    - name: Build ensure_dirs
-      ansible.builtin.set_fact:
-        ensure_dirs: >-
-          {{
-            [
-              (sync_map.airflow.dest_dags     | default(None)),
-              (sync_map.airflow.dest_plugins  | default(None)),
-              (sync_map.kafka.dest_config     | default(None)),
-              (sync_map.kafka.dest_scripts    | default(None)),
-              (sync_map.spark.dest_jobs       | default(None)),
-              (sync_map.spark.dest_conf       | default(None))
-            ] | select('defined') | select('string')
-          }}
-
-    - name: Crear árboles destino
-      ansible.builtin.file:
-        path: "{{ item }}"
-        state: directory
-        mode: "0775"
-      loop: "{{ ensure_dirs | default([]) }}"
-
-    - name: Permisos (Airflow)
-      ansible.builtin.file:
-        path: "{{ item }}"
-        state: directory
-        recurse: true
-        owner: "{{ sync_map.airflow.uid | default(50000) }}"
-        group: "{{ sync_map.airflow.gid | default(50000) }}"
-      loop:
-        - "{{ sync_map.airflow.dest_dags | default(omit) }}"
-        - "{{ sync_map.airflow.dest_plugins | default(omit) }}"
-      when: sync_map.airflow is defined
-
-    - name: Permisos (Kafka)
-      ansible.builtin.file:
-        path: "{{ item }}"
-        state: directory
-        recurse: true
-        owner: "{{ sync_map.kafka.uid | default(1000) }}"
-        group: "{{ sync_map.kafka.gid | default(1000) }}"
-      loop:
-        - "{{ sync_map.kafka.dest_config | default(omit) }}"
-        - "{{ sync_map.kafka.dest_scripts | default(omit) }}"
-      when: sync_map.kafka is defined
-
-    - name: Permisos (Spark)
-      ansible.builtin.file:
-        path: "{{ item }}"
-        state: directory
-        recurse: true
-        owner: "{{ sync_map.spark.uid | default(1000) }}"
-        group: "{{ sync_map.spark.gid | default(1000) }}"
-      loop:
-        - "{{ sync_map.spark.dest_jobs | default(omit) }}"
-        - "{{ sync_map.spark.dest_conf | default(omit) }}"
-      when: sync_map.spark is defined
-
-  tasks:
-    # ====== AIRFLOW ======
-    - name: Sync Airflow DAGs (rsync)
-      ansible.posix.synchronize:
-        src: "{{ sync_map.airflow.src_dags }}/"
-        dest: "{{ sync_map.airflow.dest_dags }}/"
-        delete: false
-        recursive: true
-      delegate_to: localhost
-      when:
-        - sync_map.airflow is defined
-        - prefer_rsync | bool
-        - st_airflow_dags is defined and st_airflow_dags.stat.exists
-
-    - name: Sync Airflow DAGs (fallback copy)
-      ansible.builtin.copy:
-        src: "{{ sync_map.airflow.src_dags }}/"
-        dest: "{{ sync_map.airflow.dest_dags }}/"
-        mode: "0644"
-      when:
-        - sync_map.airflow is defined
-        - (not prefer_rsync | bool)
-        - st_airflow_dags is defined and st_airflow_dags.stat.exists
-
-    - name: Sync Airflow plugins (rsync)
-      ansible.posix.synchronize:
-        src: "{{ sync_map.airflow.src_plugins }}/"
-        dest: "{{ sync_map.airflow.dest_plugins }}/"
-        delete: false
-        recursive: true
-      delegate_to: localhost
-      when:
-        - sync_map.airflow is defined
-        - prefer_rsync | bool
-        - st_airflow_plugins is defined and st_airflow_plugins.stat.exists
-
-    - name: Sync Airflow plugins (fallback copy)
-      ansible.builtin.copy:
-        src: "{{ sync_map.airflow.src_plugins }}/"
-        dest: "{{ sync_map.airflow.dest_plugins }}/"
-        mode: "0644"
-      when:
-        - sync_map.airflow is defined
-        - (not prefer_rsync | bool)
-        - st_airflow_plugins is defined and st_airflow_plugins.stat.exists
-
-    # ====== KAFKA ======
-    - name: Sync Kafka config (rsync)
-      ansible.posix.synchronize:
-        src: "{{ sync_map.kafka.src_config }}/"
-        dest: "{{ sync_map.kafka.dest_config }}/"
-        recursive: true
-      delegate_to: localhost
-      when:
-        - sync_map.kafka is defined
-        - prefer_rsync | bool
-        - st_kafka_config is defined and st_kafka_config.stat.exists
-
-    - name: Sync Kafka config (fallback copy)
-      ansible.builtin.copy:
-        src: "{{ sync_map.kafka.src_config }}/"
-        dest: "{{ sync_map.kafka.dest_config }}/"
-        mode: "0644"
-      when:
-        - sync_map.kafka is defined
-        - (not prefer_rsync | bool)
-        - st_kafka_config is defined and st_kafka_config.stat.exists
-
-    - name: Sync Kafka scripts (rsync)
-      ansible.posix.synchronize:
-        src: "{{ sync_map.kafka.src_scripts }}/"
-        dest: "{{ sync_map.kafka.dest_scripts }}/"
-        recursive: true
-      delegate_to: localhost
-      when:
-        - sync_map.kafka is defined
-        - prefer_rsync | bool
-        - st_kafka_scripts is defined and st_kafka_scripts.stat.exists
-
-    - name: Sync Kafka scripts (fallback copy)
-      ansible.builtin.copy:
-        src: "{{ sync_map.kafka.src_scripts }}/"
-        dest: "{{ sync_map.kafka.dest_scripts }}/"
-        mode: "0755"
-      when:
-        - sync_map.kafka is defined
-        - (not prefer_rsync | bool)
-        - st_kafka_scripts is defined and st_kafka_scripts.stat.exists
-
-    # ====== SPARK ======
-    - name: Sync Spark jobs (rsync)
-      ansible.posix.synchronize:
-        src: "{{ sync_map.spark.src_jobs }}/"
-        dest: "{{ sync_map.spark.dest_jobs }}/"
-        recursive: true
-      delegate_to: localhost
-      when:
-        - sync_map.spark is defined
-        - prefer_rsync | bool
-        - st_spark_jobs is defined and st_spark_jobs.stat.exists
-
-    - name: Sync Spark jobs (fallback copy)
-      ansible.builtin.copy:
-        src: "{{ sync_map.spark.src_jobs }}/"
-        dest: "{{ sync_map.spark.dest_jobs }}/"
-        mode: "0644"
-      when:
-        - sync_map.spark is defined
-        - (not prefer_rsync | bool)
-        - st_spark_jobs is defined and st_spark_jobs.stat.exists
-
-    - name: Sync Spark conf (rsync)
-      ansible.posix.synchronize:
-        src: "{{ sync_map.spark.src_conf }}/"
-        dest: "{{ sync_map.spark.dest_conf }}/"
-        recursive: true
-      delegate_to: localhost
-      when:
-        - sync_map.spark is defined
-        - prefer_rsync | bool
-        - st_spark_conf is defined and st_spark_conf.stat.exists
-
-    - name: Sync Spark conf (fallback copy)
-      ansible.builtin.copy:
-        src: "{{ sync_map.spark.src_conf }}/"
-        dest: "{{ sync_map.spark.dest_conf }}/"
-        mode: "0644"
-      when:
-        - sync_map.spark is defined
-        - (not prefer_rsync | bool)
-        - st_spark_conf is defined and st_spark_conf.stat.exists
-
-  post_tasks:
-    - name: Listado final de destinos
-      ansible.builtin.shell: |
-        set -e
-        echo "AIRFLOW DAGS:";    ls -la {{ sync_map.airflow.dest_dags | default('/dev/null') }} || true
-        echo "AIRFLOW plugins:"; ls -la {{ sync_map.airflow.dest_plugins | default('/dev/null') }} || true
-        echo "KAFKA config:";    ls -la {{ sync_map.kafka.dest_config | default('/dev/null') }} || true
-        echo "KAFKA scripts:";   ls -la {{ sync_map.kafka.dest_scripts | default('/dev/null') }} || true
-        echo "SPARK jobs:";      ls -la {{ sync_map.spark.dest_jobs | default('/dev/null') }} || true
-        echo "SPARK conf:";      ls -la {{ sync_map.spark.dest_conf | default('/dev/null') }} || true
-      args:
-        executable: /bin/bash
-      register: listout
-      changed_when: false
-
-    - ansible.builtin.debug:
-        var: listout.stdout_lines
 
 - name: Sync de artefactos (configs Prometheus, DAGs, etc.)
-  hosts: all
-  gather_facts: false
-  become: true
-  vars:
-    prefer_rsync: true
-  tasks:
-    - name: Crear destino conf Prometheus (si existe sync_map.mon)
-      when: hostvars[inventory_hostname].inventory_hostname == "mon-core" and (sync_map.mon is defined)
-      file:
-        path: "{{ sync_map.mon.dest_prom_conf }}"
-        state: directory
-        owner: "{{ sync_map.mon.uid | default(0) }}"
-        group: "{{ sync_map.mon.gid | default(0) }}"
-        mode: "0755"
+hosts: all
+gather_facts: false
+become: true
+vars:
+prefer_rsync: true
+tasks:
+- name: Crear destino conf Prometheus (si existe sync_map.mon)
+when: hostvars[inventory_hostname].inventory_hostname == "mon-core" and (sync_map.mon is defined)
+file:
+path: "{{ sync_map.mon.dest_prom_conf }}"
+state: directory
+owner: "{{ sync_map.mon.uid | default(0) }}"
+group: "{{ sync_map.mon.gid | default(0) }}"
+mode: "0755"
 
-    - name: Sincronizar conf Prometheus (rsync si disponible)
-      when: hostvars[inventory_hostname].inventory_hostname == "mon-core" and (sync_map.mon is defined)
-      block:
-        - name: Con rsync
-          synchronize:
-            src: "{{ sync_map.mon.src_prom_conf }}/"
-            dest: "{{ sync_map.mon.dest_prom_conf }}/"
-            rsync_opts:
-              - "--delete"
-          delegate_to: localhost
-          when: prefer_rsync | bool
 
-        - name: Sin rsync (fallback)
-          copy:
-            src: "{{ sync_map.mon.src_prom_conf }}/"
-            dest: "{{ sync_map.mon.dest_prom_conf }}/"
-            owner: "{{ sync_map.mon.uid | default(0) }}"
-            group: "{{ sync_map.mon.gid | default(0) }}"
-            mode: "0644"
-          when: not prefer_rsync | bool
+- name: Sincronizar conf Prometheus (rsync si disponible)
+when: hostvars[inventory_hostname].inventory_hostname == "mon-core" and (sync_map.mon is defined)
+block:
+- name: Con rsync
+synchronize:
+src: "{{ sync_map.mon.src_prom_conf }}/"
+dest: "{{ sync_map.mon.dest_prom_conf }}/"
+rsync_opts:
+- "--delete"
+delegate_to: localhost
+when: prefer_rsync | bool
+
+
+- name: Sin rsync (fallback)
+copy:
+src: "{{ sync_map.mon.src_prom_conf }}/"
+dest: "{{ sync_map.mon.dest_prom_conf }}/"
+owner: "{{ sync_map.mon.uid | default(0) }}"
+group: "{{ sync_map.mon.gid | default(0) }}"
+mode: "0644"
+when: not prefer_rsync | bool

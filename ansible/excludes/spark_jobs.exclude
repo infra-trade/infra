@@ -1,0 +1,3 @@
+# Excluir datasets temporales o artefactos locales
+*.ipynb_checkpoints/
+*.tmp

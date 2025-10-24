@@ -1,0 +1,33 @@
+---
+- name: Minimal hardening
+hosts: core_vms:monitor:agent_nodes
+become: true
+gather_facts: false
+tasks:
+- name: Unattended upgrades
+ansible.builtin.apt:
+name: unattended-upgrades
+state: present
+update_cache: yes
+
+
+- name: Enable unattended-upgrades
+ansible.builtin.copy:
+dest: /etc/apt/apt.conf.d/20auto-upgrades
+mode: "0644"
+content: |
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+
+
+- name: Install fail2ban and chrony
+ansible.builtin.apt:
+name: [fail2ban, chrony]
+state: present
+
+
+- name: Ensure chrony enabled
+ansible.builtin.systemd:
+name: chrony
+state: started
+enabled: true

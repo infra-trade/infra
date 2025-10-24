@@ -2,69 +2,68 @@
 # 36_portainer_git_stacks.yml
 # Create/Update Portainer stacks resolving endpointId dynamically by name or numeric id.
 
+
 - name: Create/Update Portainer stacks from Git (dynamic endpointId)
-  hosts: mon-core
-  gather_facts: false
+hosts: mon-core
+gather_facts: false
 
-  vars:
-    # API token: environment var has priority, else var from group_vars
-    portainer_api_token: "{{ lookup('env','PORTAINER_TOKEN') | default(portainer_token | default(''), true) }}"
-    # Default aliases (you can add/override in group_vars with endpoint_aliases)
-    endpoint_aliases_default:
-      mon: local
 
-  pre_tasks:
-    - name: Assert API token present
-      ansible.builtin.assert:
-        that:
-          - portainer_api_token | length > 0
-        fail_msg: "No Portainer API key. Export PORTAINER_TOKEN or set portainer_token in group_vars."
+vars:
+portainer_api_token: "{{ lookup('env','PORTAINER_TOKEN') | default(portainer_token | default(''), true) }}"
+endpoint_aliases_default:
+mon: local
 
-    - name: Assert basic variables
-      ansible.builtin.assert:
-        that:
-          - portainer_url is defined
-          - stacks is defined
-          - stacks | length > 0
-        success_msg: "Basic variables present."
 
-    - name: Portainer connectivity check
-      ansible.builtin.uri:
-        url: "{{ portainer_url }}/api/system/status"
-        method: GET
-        headers:
-          X-API-Key: "{{ portainer_api_token }}"
-        validate_certs: "{{ portainer_validate_certs | default(false) }}"
-        return_content: true
-        status_code: 200
-      register: _status
+pre_tasks:
+- name: Assert API token present
+ansible.builtin.assert:
+that:
+- portainer_api_token | length > 0
+fail_msg: "No Portainer API key. Export PORTAINER_TOKEN or set portainer_token in group_vars."
+no_log: true
 
-    - name: Fetch endpoints from Portainer
-      ansible.builtin.uri:
-        url: "{{ portainer_url }}/api/endpoints?limit=1000"
-        method: GET
-        headers:
-          X-API-Key: "{{ portainer_api_token }}"
-        validate_certs: "{{ portainer_validate_certs | default(false) }}"
-        return_content: true
-        status_code: 200
-      register: _endpoints
 
-    - name: Build endpoints maps/lists
-      ansible.builtin.set_fact:
-        endpoints_map: "{{ dict( (_endpoints.json | map(attribute='Name') | list) | zip(_endpoints.json | map(attribute='Id') | list) ) }}"
-        endpoints_names: "{{ _endpoints.json | map(attribute='Name') | list }}"
-        endpoints_list: "{{ _endpoints.json | json_query('[].{Id: Id, Name: Name, URL: URL, PublicURL: PublicURL, Type: Type}') }}"
-        endpoint_aliases_effective: "{{ endpoint_aliases_default | combine(endpoint_aliases | default({}), recursive=True) }}"
+- name: Assert basic variables
+ansible.builtin.assert:
+that:
+- portainer_url is defined
+- stacks is defined
+- stacks | length > 0
+success_msg: "Basic variables present."
 
-    - name: Show detected endpoints (audit)
-      ansible.builtin.debug:
-        var: endpoints_list
 
-  tasks:
-    # Hacemos loop sobre include_tasks (válido); cada iteración resuelve endpoint y despliega
-    - name: Resolve endpoint and deploy stack (per item)
-      ansible.builtin.include_tasks: "tasks/resolve_portainer_endpoint_and_deploy.yml"
-      loop: "{{ stacks }}"
-      loop_control:
-        loop_var: st
+- name: Portainer connectivity check
+ansible.builtin.uri:
+url: "{{ portainer_url }}/api/system/status"
+method: GET
+headers:
+X-API-Key: "{{ portainer_api_token }}"
+validate_certs: "{{ portainer_validate_certs | default(false) }}"
+return_content: true
+status_code: 200
+register: _status
+no_log: true
+
+
+- name: Fetch endpoints from Portainer
+ansible.builtin.uri:
+url: "{{ portainer_url }}/api/endpoints?limit=1000"
+method: GET
+headers:
+X-API-Key: "{{ portainer_api_token }}"
+validate_certs: "{{ portainer_validate_certs | default(false) }}"
+return_content: true
+status_code: 200
+register: _endpoints
+no_log: true
+
+
+- name: Build endpoints maps/lists
+ansible.builtin.set_fact:
+endpoints_map: "{{ dict( (_endpoints.json | map(attribute='Name') | list) | zip(_endpoints.json | map(attribute='Id') | list) ) }}"
+endpoints_names: "{{ _endpoints.json | map(attribute='Name') | list }}"
+endpoints_list: "{{ _endpoints.json | json_query('[].{Id: Id, Name: Name, URL: URL, PublicURL: PublicURL, Type: Type}') }}"
+endpoint_aliases_effective: "{{ endpoint_aliases_default | combine(endpoint_aliases | default({}), recursive=True) }}"
+
+
+loop_var: st

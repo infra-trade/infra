@@ -1,0 +1,41 @@
+name: ci-cd
+on:
+push: { branches: ["main"] }
+pull_request:
+jobs:
+validate:
+runs-on: ubuntu-latest
+steps:
+- uses: actions/checkout@v4
+- uses: actions/setup-python@v5
+with: { python-version: "3.11" }
+- run: pip install ruff ansible ansible-lint
+- run: ruff check .
+- run: ansible-lint .
+
+
+dry-run:
+needs: validate
+runs-on: ubuntu-latest
+steps:
+- uses: actions/checkout@v4
+- uses: dawidd6/action-ansible-playbook@v2
+with:
+playbook: 98_sync_artifacts.yml
+options: "-i inventory.ini --check -e prefer_rsync=true -e precheck.enable=true"
+env:
+PORTAINER_TOKEN: ${{ secrets.PORTAINER_TOKEN }}
+
+
+deploy:
+if: github.ref == 'refs/heads/main'
+needs: dry-run
+runs-on: ubuntu-latest
+steps:
+- uses: actions/checkout@v4
+- uses: dawidd6/action-ansible-playbook@v2
+with:
+playbook: 98_sync_artifacts.yml
+options: "-i inventory.ini -e prefer_rsync=true -e precheck.enable=true"
+env:
+PORTAINER_TOKEN: ${{ secrets.PORTAINER_TOKEN }}
