@@ -98,7 +98,7 @@
     GIT_SSH_COMMAND: "{{ _git_ssh_command }}"
   delegate_to: localhost
 
-# ====== Leer compose y .env, y normalizar Env ======
+# ====== Leer compose ======
 - name: Verificar que el compose exista
   ansible.builtin.stat:
     path: "{{ _compose_abs }}"
@@ -121,7 +121,7 @@
     _compose_text: "{{ _compose_raw.content | b64decode }}"
   delegate_to: localhost
 
-# Parsear .env si existe
+# ====== .env opcional y fusión con st.env ======
 - name: Verificar si existe .env al lado del compose
   ansible.builtin.stat:
     path: "{{ _dotenv_abs }}"
@@ -148,30 +148,19 @@
   when: _dotenv_stat.stat.exists
   delegate_to: localhost
 
-- name: Convertir dict .env a lista Env
+- name: Construir overrides desde st.env (lista -> dict)
   ansible.builtin.set_fact:
-    _env_list_from_dotenv: >-
-      {{ (_env_from_dotenv | default({})).keys()
-          | list
-          | map('community.general.dict_kv', _env_from_dotenv)
-          | map('extract', 'item')
-          | map('combine', {'name': item.key, 'value': item.value})
-          | list }}
-  vars:
-    item: "{{ item | default({}) }}"
+    _env_overrides: "{{ dict( (st.env | default([])) | map(attribute='name') | zip((st.env | default([])) | map(attribute='value')) ) }}"
   delegate_to: localhost
 
-# Fusionar Env: st.env tiene prioridad sobre .env
-- name: Fusionar variables de entorno (st.env sobre .env)
+- name: Fusionar .env con overrides (st.env tiene prioridad)
   ansible.builtin.set_fact:
-    _env_final: >-
-      {{
-        (
-          dict( (_env_list_from_dotenv | default([])) | map(attribute='name') | zip((_env_list_from_dotenv | default([])) | map(attribute='value')) )
-          | combine( dict( (st.env | default([])) | map(attribute='name') | zip((st.env | default([])) | map(attribute='value')) ), recursive=True)
-        )
-        | dict2items(key_name='name', value_name='value')
-      }}
+    _env_merged_dict: "{{ (_env_from_dotenv | default({})) | combine(_env_overrides, recursive=True) }}"
+  delegate_to: localhost
+
+- name: Preparar _env_final para Portainer (lista de {name,value})
+  ansible.builtin.set_fact:
+    _env_final: "{{ _env_merged_dict | dict2items(key_name='name', value_name='value') }}"
   delegate_to: localhost
 
 # ====== Sanitizar compose: remover env_file (para no depender del archivo) ======
