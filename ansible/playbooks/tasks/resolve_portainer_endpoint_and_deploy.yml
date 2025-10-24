@@ -1,9 +1,4 @@
 ---
-# Espera las vars:
-#   st: { name, repo_url, git_ref, file_path, endpoint | endpoint_id, env, prune }
-#   portainer_url, portainer_api_token, portainer_validate_certs
-#   endpoints_by_name, endpoint_aliases_effective
-
 - name: Validate required fields for stack {{ st.name }}
   ansible.builtin.assert:
     that:
@@ -30,7 +25,6 @@
     that: _endpoint_id_resolved | string | length > 0
     fail_msg: "No se pudo resolver endpointId para stack {{ st.name }} (endpoint='{{ st.endpoint | default('') }}')."
 
-# --------------------- Buscar si el stack ya existe ---------------------
 - name: Fetch stacks list
   ansible.builtin.uri:
     url: "{{ portainer_url }}/api/stacks"
@@ -46,7 +40,6 @@
     _existing_stack: "{{ (_stacks.json | selectattr('Name','equalto', st.name) | list | first) | default(None) }}"
     _existing_stack_id: "{{ ((_stacks.json | selectattr('Name','equalto', st.name) | list | first).Id) | default(None) }}"
 
-# --------------------- Crear si no existe ---------------------
 - name: Create stack {{ st.name }} from repository (compose/standalone)
   when: _existing_stack_id is not defined
   ansible.builtin.uri:
@@ -65,13 +58,8 @@
       ComposeFilePathInRepository: "{{ st.file_path }}"
       Env: "{{ st.env | default([]) }}"
       Prune: "{{ st.prune | default(true) }}"
-      # Si usas Git privado vía SSH, puedes añadir:
-      # RepositoryAuthentication: true
-      # RepositoryGitCredentialID: 0
-      # RepositoryPassword: "{{ lookup('env','PORTAINER_PRIVATE_KEY') | default(omit) }}"
   register: _create
 
-# --------------------- Redeploy si existe (pull + prune) ---------------------
 - name: Update git reference (optional) on existing stack {{ st.name }}
   when: _existing_stack_id is defined and (st.git_ref is defined or st.file_path is defined)
   ansible.builtin.uri:
@@ -84,7 +72,6 @@
     status_code: 200
     body_format: json
     body:
-      # Partial update: solo campos relevantes
       RepositoryReferenceName: "{{ st.git_ref | default(omit) }}"
       ComposeFilePathInRepository: "{{ st.file_path | default(omit) }}"
   register: _update
