@@ -4,9 +4,9 @@
   become: true
 
   vars:
-    # Puedes sobreescribirlos desde group_vars
-    iac_root: "{{ iac_root | default('/home/ansible/IaC') }}"
-    prefer_rsync: "{{ prefer_rsync | default(true) }}"
+    # Defaults locales. Si quieres override, usa group_vars/ o -e en CLI.
+    iac_root: "/home/ansible/IaC"
+    prefer_rsync: true
 
   pre_tasks:
     - name: Mostrar grupo/hosts destino
@@ -91,8 +91,8 @@
         mode: "0775"
       loop: "{{ ensure_dirs | default([]) }}"
 
-    # ====== Validar usuarios/grupos (evitar root-owned inesperado) ======
-    - name: Validate users/groups exist for stacks (UID)
+    # ====== Validar usuarios/grupos ======
+    - name: Validate users (UID)
       ansible.builtin.command: "getent passwd {{ item.uid }}"
       register: _uid
       failed_when: _uid.rc != 0
@@ -103,7 +103,7 @@
         - { name: "kafka",   uid: "{{ sync_map.kafka.uid   | default(omit) }}" }
         - { name: "spark",   uid: "{{ sync_map.spark.uid   | default(omit) }}" }
 
-    - name: Validate users/groups exist for stacks (GID)
+    - name: Validate groups (GID)
       ansible.builtin.command: "getent group {{ item.gid }}"
       register: _gid
       failed_when: _gid.rc != 0
@@ -151,7 +151,7 @@
         - "{{ sync_map.spark.dest_conf | default(omit) }}"
       when: sync_map.spark is defined
 
-    # ====== Prechecks (lint/parsing/version) ======
+    # ====== Prechecks opcionales ======
     - block:
         - name: Python lint (ruff) para DAGs
           ansible.builtin.command: "{{ precheck.python_bin }} -m ruff check {{ sync_map.airflow.src_dags }}"
@@ -180,7 +180,7 @@
             msg: "Precheck failed. ruff={{ ruff_result.rc | default('n/a') }}, airflow={{ airflow_list.rc | default('n/a') }}, spark={{ spark_v.rc | default('n/a') }}"
 
   tasks:
-    # ====== AIRFLOW (Atomic deploy de DAGs) ======
+    # ====== AIRFLOW (Atomic deploy opcional) ======
     - name: Prepare Airflow releases/current (vars)
       ansible.builtin.set_fact:
         release_ts: "{{ ansible_date_time.iso8601_basic }}"
@@ -234,7 +234,7 @@
         executable: /bin/bash
       when: (atomic_deploy.enable | default(false)) and (sync_map.airflow is defined) and (st_airflow_dags.stat.exists | default(false))
 
-    # Fallback: Sync DAGs sin atomic (o cuando prefer_rsync=false)
+    # Fallback/sin atomic:
     - name: Sync Airflow DAGs (rsync simple)
       ansible.posix.synchronize:
         src: "{{ sync_map.airflow.src_dags }}/"
@@ -348,11 +348,19 @@
         - (not prefer_rsync | bool)
         - st_kafka_scripts is defined and st_kafka_scripts.stat.exists
 
+    - name: Find files under kafka/scripts to chmod
+      ansible.builtin.find:
+        paths: "{{ sync_map.kafka.dest_scripts }}"
+        recurse: true
+        file_type: file
+      register: _kafka_scripts_found
+      when: sync_map.kafka is defined
+
     - name: Ensure executables under kafka/scripts
       ansible.builtin.file:
         path: "{{ item.path }}"
         mode: "0755"
-      loop: "{{ query('ansible.builtin.find', paths=sync_map.kafka.dest_scripts, patterns='*', recurse=True) }}"
+      loop: "{{ _kafka_scripts_found.files | default([]) }}"
       when: sync_map.kafka is defined
 
     # ====== SPARK ======
@@ -373,7 +381,7 @@
     - name: Sync Spark jobs (fallback copy)
       ansible.builtin.copy:
         src: "{{ sync_map.spark.src_jobs }}/"
-        dest: "{{ sync_map.spark.dest_jobs }}/ }}"
+        dest: "{{ sync_map.spark.dest_jobs }}/"
         mode: "0644"
       when:
         - sync_map.spark is defined
