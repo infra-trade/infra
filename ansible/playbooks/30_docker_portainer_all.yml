@@ -2,11 +2,6 @@
 # =============================================================================
 # Install/Upgrade Docker Engine (Ubuntu 22.04+) + compose plugin
 # Deploy/Upgrade Portainer CE (monitor) + Portainer Agent (todos)
-#
-# Lee, si existen, estas vars desde group_vars/all.yml:
-#   portainer_image: "portainer/portainer-ce:2.21.5"
-#   agent_image:     "portainer/agent:2.21.5"
-# En caso de que no se carguen (estructura de carpetas), aplican defaults abajo.
 # =============================================================================
 
 - name: Install/Upgrade Docker Engine (Ubuntu 22.04+) + compose plugin
@@ -15,10 +10,7 @@
   gather_facts: true
 
   vars:
-    # Defaults seguros (por si group_vars no se carga en tu layout)
-    portainer_image: "{{ portainer_image | default('portainer/portainer-ce:2.21.5') }}"
-    agent_image: "{{ agent_image | default('portainer/agent:2.21.5') }}"
-
+    # ---- Docker repo / keyring
     docker_repo_url: "https://download.docker.com/linux/ubuntu"
     docker_key_dst: "/etc/apt/keyrings/docker.gpg"
     docker_repo_file: "/etc/apt/sources.list.d/docker.list"
@@ -31,10 +23,12 @@
       - docker-buildx-plugin
       - docker-compose-plugin
 
-    # Fallback desde Ubuntu (requiere 'universe' para docker-compose-plugin)
+    # Fallback desde Ubuntu (requiere 'universe' para docker-compose-plugin; si no existe, haremos install manual)
     docker_ubuntu_packages:
       - docker.io
-      - docker-compose-plugin
+
+    # Versión de Docker Compose (para instalación manual si fuese necesario)
+    compose_version: "v2.40.2"
 
   pre_tasks:
     - name: Ensure prereqs (curl, gnupg, lsb-release, ca-certificates, software-properties-common)
@@ -51,11 +45,9 @@
     - name: Enable 'universe' component (idempotent)
       command: add-apt-repository -y universe
       register: add_universe
-      changed_when: "'enabled' in add_universe.stdout or add_universe.rc == 0"
+      changed_when: add_universe.rc == 0
       failed_when: add_universe.rc not in [0]
-      # En repetidas ejecuciones, no rompe ni marca fail.
 
-    # Limpieza de llaves viejas en cada host
     - name: Remove old docker keys in trusted.gpg.d (cleanup)
       file:
         path: "{{ item }}"
@@ -65,7 +57,6 @@
         - /etc/apt/trusted.gpg.d/docker.asc
         - /etc/apt/trusted.gpg.d/download.docker.com.gpg
 
-    # Descargar la GPG en el controlador y distribuir
     - name: Download Docker GPG (ASCII) to controller /tmp
       delegate_to: localhost
       run_once: true
@@ -74,7 +65,6 @@
         dest: "/tmp/docker.asc"
         mode: "0644"
         validate_certs: true
-      register: docker_gpg_ctrl
 
     - name: Ensure /etc/apt/keyrings exists
       file:
@@ -108,6 +98,10 @@
       set_fact:
         ubuntu_codename: "{{ ansible_facts.lsb.codename | default('jammy') }}"
         arch_deb: "{{ ansible_facts.architecture | default('amd64') }}"
+        compose_arch: >-
+          {{ 'x86_64' if ansible_facts.architecture in ['x86_64','amd64'] else
+             'aarch64' if ansible_facts.architecture in ['aarch64','arm64'] else
+             ansible_facts.architecture }}
 
     - name: Write Docker apt repo (codename + signed-by)
       copy:
@@ -149,7 +143,7 @@
         - docker_ce_candidate.stdout is defined
         - docker_ce_candidate.stdout != "(none)"
 
-    # Fallback si el repo de Docker no tiene paquetes (o arquitectura/codename no soportado)
+    # Fallback: docker.io + (compose plugin por APT si existe, si no, instalación manual)
     - name: Install Docker (Ubuntu fallback) if docker-ce not available
       apt:
         name: "{{ docker_ubuntu_packages }}"
@@ -158,6 +152,61 @@
       when:
         - docker_ce_candidate.stdout is not defined
           or docker_ce_candidate.stdout == "(none)"
+
+    - name: Check if docker-compose-plugin candidate exists (fallback path)
+      shell: |
+        set -o pipefail
+        apt-cache policy docker-compose-plugin | awk '/Candidate:/ {print $2}'
+      args:
+        executable: /bin/bash
+      register: compose_candidate
+      changed_when: false
+      when:
+        - docker_ce_candidate.stdout is not defined
+          or docker_ce_candidate.stdout == "(none)"
+
+    - name: Install docker-compose-plugin from Ubuntu (if available)
+      apt:
+        name: docker-compose-plugin
+        state: present
+      when:
+        - docker_ce_candidate.stdout is not defined
+          or docker_ce_candidate.stdout == "(none)"
+        - compose_candidate.stdout is defined
+        - compose_candidate.stdout != "(none)"
+
+    - name: Ensure cli-plugins dir exists for manual compose
+      file:
+        path: /usr/local/lib/docker/cli-plugins
+        state: directory
+        mode: "0755"
+      when:
+        - docker_ce_candidate.stdout is not defined
+          or docker_ce_candidate.stdout == "(none)"
+        - compose_candidate.stdout is not defined
+          or compose_candidate.stdout == "(none)"
+
+    - name: Manual install Docker Compose v2 (when plugin not in APT)
+      get_url:
+        url: "https://github.com/docker/compose/releases/download/{{ compose_version }}/docker-compose-linux-{{ compose_arch }}"
+        dest: /usr/local/lib/docker/cli-plugins/docker-compose
+        mode: "0755"
+      when:
+        - docker_ce_candidate.stdout is not defined
+          or docker_ce_candidate.stdout == "(none)"
+        - compose_candidate.stdout is not defined
+          or compose_candidate.stdout == "(none)"
+
+    - name: Symlink legacy docker-compose (optional)
+      file:
+        src: /usr/local/lib/docker/cli-plugins/docker-compose
+        dest: /usr/local/bin/docker-compose
+        state: link
+      when:
+        - docker_ce_candidate.stdout is not defined
+          or docker_ce_candidate.stdout == "(none)"
+        - compose_candidate.stdout is not defined
+          or compose_candidate.stdout == "(none)"
 
     - name: Enable & start docker
       systemd:
@@ -177,7 +226,8 @@
       shell: |
         set -e
         docker --version
-        docker compose version
+        docker compose version || true
+        docker-compose --version || true
       register: docker_versions
       changed_when: false
       failed_when: false
@@ -194,8 +244,8 @@
   gather_facts: false
 
   vars:
-    # Defaults en caso de que no se lean de group_vars
-    portainer_image: "{{ portainer_image | default('portainer/portainer-ce:2.21.5') }}"
+    # usar variable de group_vars si existe; si no, fallback seguro
+    portainer_image_final: "{{ (hostvars[inventory_hostname].portainer_image | default('portainer/portainer-ce:2.21.5')) }}"
     portainer_data: "portainer_data"
     portainer_http_port: 9000
     portainer_https_port: 9443
@@ -214,13 +264,13 @@
 
     - name: Pull pinned Portainer CE image
       community.docker.docker_image:
-        name: "{{ portainer_image }}"
+        name: "{{ portainer_image_final }}"
         source: pull
 
     - name: Run/Update Portainer CE container
       community.docker.docker_container:
         name: portainer
-        image: "{{ portainer_image }}"
+        image: "{{ portainer_image_final }}"
         restart_policy: always
         state: started
         recreate: true
@@ -240,8 +290,7 @@
 
   vars:
     agent_port: 9001
-    # Default por si no llega desde group_vars
-    agent_image: "{{ agent_image | default('portainer/agent:2.21.5') }}"
+    agent_image_final: "{{ (hostvars[inventory_hostname].agent_image | default('portainer/agent:2.21.5')) }}"
 
   tasks:
     - name: Ensure docker is running
@@ -252,14 +301,13 @@
 
     - name: Pull pinned Portainer Agent image
       community.docker.docker_image:
-        name: "{{ agent_image }}"
+        name: "{{ agent_image_final }}"
         source: pull
 
-    # Intento con puerto publicado
     - name: Run/Update Portainer Agent container (try with published port)
       community.docker.docker_container:
         name: portainer-agent
-        image: "{{ agent_image }}"
+        image: "{{ agent_image_final }}"
         restart_policy: always
         state: started
         recreate: true
@@ -283,7 +331,7 @@
     - name: Run/Update Portainer Agent container (fallback without published port)
       community.docker.docker_container:
         name: portainer-agent
-        image: "{{ agent_image }}"
+        image: "{{ agent_image_final }}"
         restart_policy: always
         state: started
         recreate: true
