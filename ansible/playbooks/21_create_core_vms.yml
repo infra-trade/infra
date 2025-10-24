@@ -2,7 +2,6 @@
 - name: Create/Update core VMs per catalog (clone, cpu/ram, net, resize root/data, growfs)
   hosts: localhost
   gather_facts: false
-
   collections:
     - community.proxmox
 
@@ -14,12 +13,13 @@
     pm_api_token_secret: "{{ lookup('env','PM_API_TOKEN_SECRET') }}"
     pm_node: "pve1"
     validate_certs: false
-    pve_ssh_host: "192.168.100.100"   # host para delegate_to
+
+    pve_ssh_host: "192.168.100.100" # host para delegate_to
 
     # ===== Template y storages =====
-    template_name: "ubuntu-22.04-cloudinit"     # marcado como template
-    storage_system: "local-lvm"                 # LVM-thin
-    snippets_store: "local"                     # con snippets habilitado
+    template_name: "ubuntu-22.04-cloudinit"  # marcado como template
+    storage_system: "local-lvm"              # LVM-thin
+    snippets_store: "local"                  # con snippets habilitado
 
     # ===== Red / VLAN =====
     net_bridge: "vmbr1"
@@ -28,7 +28,7 @@
     dns_servers: ["1.1.1.1","8.8.8.8"]
 
     # ===== Acceso guest =====
-    ci_user: "ansible"          # usuario creado por tu user-data
+    ci_user: "ansible"       # usuario creado por tu user-data
     ssh_wait_timeout: 420
 
     # ===== Cloud-init user-data ya existente =====
@@ -39,11 +39,11 @@
 
     # ===== Catálogo de VMs =====
     vms:
-      airflow-core: { vmid: 9301, cpu: 12, mem: 32768, disk_gb: 120, ip: "10.20.0.10/24",  data_disk_gb: 100 }
-      kafka-core:   { vmid: 9302, cpu: 6,  mem: 24576, disk_gb: 160, ip: "10.20.0.22/24",  data_disk_gb: 300 }
-      spark-core:   { vmid: 9303, cpu: 12, mem: 32768, disk_gb: 160, ip: "10.20.0.23/24",  data_disk_gb: 200 }
-      db-core:      { vmid: 9304, cpu: 6,  mem: 16384, disk_gb: 100, ip: "10.20.0.21/24",  data_disk_gb: 400 }
-      mon-core:     { vmid: 9305, cpu: 4,  mem: 12288, disk_gb: 120, ip: "10.20.0.12/24",  data_disk_gb: 200 }
+      airflow-core: { vmid: 9301, cpu: 12, mem: 32768, disk_gb: 120, ip: "10.20.0.10/24", data_disk_gb: 100 }
+      kafka-core:   { vmid: 9302, cpu: 6,  mem: 24576, disk_gb: 160, ip: "10.20.0.22/24", data_disk_gb: 300 }
+      spark-core:   { vmid: 9303, cpu: 12, mem: 32768, disk_gb: 160, ip: "10.20.0.23/24", data_disk_gb: 200 }
+      db-core:      { vmid: 9304, cpu: 6,  mem: 16384, disk_gb: 100, ip: "10.20.0.21/24", data_disk_gb: 400 }
+      mon-core:     { vmid: 9305, cpu: 4,  mem: 12288, disk_gb: 120, ip: "10.20.0.12/24", data_disk_gb: 200 }
 
   pre_tasks:
     - name: Preparar facts comunes
@@ -164,15 +164,18 @@
       shell: |
         set -e
         VMID="{{ item.value.vmid }}"
-        DES="{{ item.value.disk_gb | int }}"   # tamaño deseado en GB
+        DES="{{ item.value.disk_gb | int }}"  # tamaño deseado en GB
         CONF="/etc/pve/qemu-server/${VMID}.conf"
+
         # Detectar bus raíz: scsi0/virtio0/sata0/ide0
         BUS="$(awk -F: '/^(scsi0|virtio0|sata0|ide0):/ {print $1; exit}' "$CONF")"
         [ -z "$BUS" ] && { echo "No se detectó bus raíz en $CONF"; exit 1; }
+
         # Tamaño actual (GB)
         LINE="$(awk -F: -v b="$BUS" '$1==b{print $2; exit}' "$CONF")"
         CUR="$(echo "$LINE" | sed -n 's/.*size=\([0-9]\+\)G.*/\1/p')"
         CUR="${CUR:-0}"
+
         if [ "$DES" -gt "$CUR" ]; then
           DELTA=$((DES - CUR))
           echo "VM $VMID: $BUS crece de ${CUR}G a ${DES}G (+${DELTA}G)"
@@ -193,15 +196,19 @@
         VMID="{{ item.value.vmid }}"
         DES="{{ item.value.data_disk_gb | default(0) | int }}"
         [ "$DES" -le 0 ] && { echo "Sin data_disk_gb para $VMID, omito."; exit 0; }
+
         CONF="/etc/pve/qemu-server/${VMID}.conf"
         LINE="$(awk -F: '/^scsi1:/{print $2; exit}' "$CONF")"
+
         if [ -z "$LINE" ]; then
           echo "VM $VMID: creando scsi1 de ${DES}G"
           qm set "$VMID" --scsi1 "{{ storage_system }}:${DES}"
           exit 0
         fi
+
         CUR="$(echo "$LINE" | sed -n 's/.*size=\([0-9]\+\)G.*/\1/p')"
         CUR="${CUR:-0}"
+
         if [ "$DES" -gt "$CUR" ]; then
           DELTA=$((DES - CUR))
           echo "VM $VMID: scsi1 crece de ${CUR}G a ${DES}G (+${DELTA}G)"
@@ -242,6 +249,7 @@
     - name: Crecer partición/FS de / y preparar /data dentro del guest
       shell: |
         set -eux
+
         # Limpieza mínima si hay poco espacio
         free0="$(df -Pm / | awk 'NR==2{print $4}')"
         if [ "${free0:-0}" -lt {{ min_free_mb }} ]; then

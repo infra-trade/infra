@@ -14,7 +14,6 @@
           - /srv/iac/airflow/redis
         owner: 50000
         group: 50000
-
       kafka:
         paths:
           - /srv/iac/kafka/data
@@ -22,14 +21,12 @@
           - /srv/iac/kafka/scripts
         owner: 1000
         group: 1000
-
       spark:
         paths:
           - /srv/iac/spark/jobs
           - /srv/iac/spark/conf
         owner: 1000
         group: 1000
-
       db:
         paths:
           - /srv/iac/db/data
