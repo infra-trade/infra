@@ -4,7 +4,6 @@
   gather_facts: false
 
   vars:
-    # Acepta certificados self-signed
     portainer_validate_certs: false
 
     # Alias por defecto (puedes sobreescribir con endpoint_aliases en group_vars/mon-core.yml)
@@ -51,12 +50,11 @@
         return_content: true
       register: _endpoints
 
-    - name: Build endpoints maps/lists
+    - name: Build endpoints maps/lists (use internal var names to avoid collisions)
       ansible.builtin.set_fact:
-        endpoints_map: "{{ dict( (_endpoints.json | map(attribute='Name') | list)
-                           | zip(_endpoints.json | map(attribute='Id') | list) ) }}"
+        __endpoints_by_name: "{{ dict( (_endpoints.json | map(attribute='Name') | list)
+                              | zip(_endpoints.json | map(attribute='Id') | list) ) }}"
         endpoints_list: "{{ _endpoints.json | json_query('[].{Id: Id, Name: Name, URL: URL, PublicURL: PublicURL, Type: Type}') }}"
-        # nombre interno para evitar colisiones con group_vars
         __alias_map: "{{ endpoint_aliases_default | combine(endpoint_aliases | default({}), recursive=True) }}"
 
     - name: Load stacks (from group_vars or -e) into stacks_effective
@@ -80,9 +78,9 @@
       loop_control:
         loop_var: st
       vars:
+        # pasar SIEMPRE con nombres diferentes a los usados arriba
         portainer_url: "{{ portainer_url_effective }}"
         portainer_api_token: "{{ portainer_api_token }}"
         portainer_validate_certs: "{{ portainer_validate_certs }}"
-        # PASAMOS con nombres distintos para evitar recursión
-        endpoints_map: "{{ endpoints_map }}"
+        endpoints_by_name_map: "{{ __endpoints_by_name }}"
         alias_map: "{{ __alias_map }}"

@@ -5,6 +5,8 @@
     _file_path: "{{ st.file_path | default(st.compose_path | default('')) }}"
     _git_ref: "{{ st.git_ref | default('main') }}"
     _env_vars: "{{ st.env | default([]) }}"
+    _endpoint: "{{ st.endpoint | default('') }}"
+    _endpoint_id: "{{ st.endpoint_id | default('') }}"
 
 - name: Validate required fields for stack {{ st.name }}
   ansible.builtin.assert:
@@ -17,20 +19,20 @@
 - name: Resolve endpointId for {{ st.name }}
   ansible.builtin.set_fact:
     _endpoint_id_resolved: >-
-      {%- if st.endpoint_id is defined -%}
-      {{ st.endpoint_id }}
-      {%- elif st.endpoint is defined -%}
-        {%- set e = st.endpoint -%}
+      {%- if _endpoint_id | string | length > 0 -%}
+        {{ _endpoint_id }}
+      {%- elif _endpoint | string | length > 0 -%}
+        {%- set e = _endpoint -%}
         {%- set alias = alias_map.get(e, e) -%}
-        {{ endpoints_map.get(alias) | default(endpoints_map.get(e)) | default('') }}
+        {{ endpoints_by_name_map.get(alias) | default(endpoints_by_name_map.get(e)) | default('') }}
       {%- else -%}
-      {{ endpoints_map.get('local') | default('') }}
+        {{ endpoints_by_name_map.get('local') | default('') }}
       {%- endif -%}
 
 - name: Fail if endpoint cannot be resolved for {{ st.name }}
   ansible.builtin.assert:
     that: _endpoint_id_resolved | string | length > 0
-    fail_msg: "No se pudo resolver endpointId para stack {{ st.name }} (endpoint='{{ st.endpoint | default('') }}')."
+    fail_msg: "No se pudo resolver endpointId para stack {{ st.name }} (endpoint='{{ _endpoint }}')."
 
 # ----- Buscar stack existente -----
 - name: Fetch stacks list
