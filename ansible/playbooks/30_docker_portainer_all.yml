@@ -5,28 +5,22 @@
 # - Despliega/actualiza Portainer CE en mon-core (HTTPS 9443)
 # - Despliega/actualiza Portainer Agent en el resto de nodos
 #
-# Requiere:
-# - group_vars/all.yml con:
-#     portainer_image: "portainer/portainer-ce:2.21.5"
-#     agent_image:     "portainer/agent:2.21.5"
+# Requiere group_vars/all.yml con:
+#   portainer_image: "portainer/portainer-ce:2.21.5"
+#   agent_image:     "portainer/agent:2.21.5"
 # =====================================================================
 
 - name: Install/Upgrade Docker Engine (Ubuntu 22.04+) + compose plugin
   hosts: all
   become: true
   gather_facts: true
-  collections:
-    - community.docker
+  collections: [community.docker]
   vars:
     docker_keyring_path: /etc/apt/keyrings/docker.gpg
   tasks:
     - name: Ensure prereqs (curl, gnupg, lsb-release, ca-certificates)
       ansible.builtin.apt:
-        name:
-          - curl
-          - gnupg
-          - lsb-release
-          - ca-certificates
+        name: [curl, gnupg, lsb-release, ca-certificates]
         state: present
         update_cache: false
 
@@ -130,10 +124,8 @@
   hosts: mon-core
   become: true
   gather_facts: false
-  collections:
-    - community.docker
+  collections: [community.docker]
   vars:
-    # No autoreferencias. Si no viene desde group_vars, usamos defaults seguros:
     portainer_image_effective: "{{ portainer_image | default('portainer/portainer-ce:2.21.5') }}"
     portainer_data_volume: portainer_data
   tasks:
@@ -162,8 +154,8 @@
         recreate: true
         pull: false
         ports:
-          - "8000:8000"     # Edge agent tunnel (opcional)
-          - "9443:9443"     # HTTPS UI/API
+          - "8000:8000"
+          - "9443:9443"
         volumes:
           - "{{ portainer_data_volume }}:/data"
           - "/var/run/docker.sock:/var/run/docker.sock"
@@ -185,16 +177,40 @@
   hosts: "all:!mon-core"
   become: true
   gather_facts: false
-  collections:
-    - community.docker
+  collections: [community.docker]
   vars:
     agent_image_effective: "{{ agent_image | default('portainer/agent:2.21.5') }}"
+    agent_port: 9001
   tasks:
     - name: Ensure docker is running
       ansible.builtin.service:
         name: docker
         state: started
         enabled: true
+
+    # ---- Limpieza idempotente del puerto ocupado (9001) ----
+    - name: Find any container publishing {{ agent_port }}
+      ansible.builtin.shell: |
+        docker ps -a --filter "publish={{ agent_port }}" --format '{{"{{"}}.ID{{"}}"}}'
+      register: agent_port_conflict_ids
+      changed_when: false
+
+    - name: Stop conflicting containers on {{ agent_port }}
+      ansible.builtin.shell: "docker stop {{ item }}"
+      loop: "{{ agent_port_conflict_ids.stdout_lines }}"
+      when: agent_port_conflict_ids.stdout | length > 0
+      register: stop_conflicts
+      changed_when: stop_conflicts.stdout is defined
+      failed_when: false
+
+    - name: Remove conflicting containers on {{ agent_port }}
+      ansible.builtin.shell: "docker rm {{ item }}"
+      loop: "{{ agent_port_conflict_ids.stdout_lines }}"
+      when: agent_port_conflict_ids.stdout | length > 0
+      register: rm_conflicts
+      changed_when: rm_conflicts.stdout is defined
+      failed_when: false
+    # --------------------------------------------------------
 
     - name: Pull pinned Portainer Agent image
       community.docker.docker_image:
@@ -210,7 +226,7 @@
         recreate: true
         pull: false
         ports:
-          - "9001:9001"
+          - "{{ agent_port }}:{{ agent_port }}"
         env:
           AGENT_CLUSTER_ADDR: "tasks.portainer-agent"
         volumes:
