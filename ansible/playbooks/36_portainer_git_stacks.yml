@@ -6,7 +6,6 @@
   vars:
     portainer_validate_certs: false
 
-    # Alias por defecto (puedes sobreescribir con endpoint_aliases en group_vars/mon-core.yml)
     endpoint_aliases_default:
       mon: local
       airflow: airflow-core
@@ -14,7 +13,7 @@
       spark: spark-core
       db: db-core
 
-    # API token: primero PORTAINER_TOKEN (env), si no portainer_token (group_vars)
+    # Prioriza PORTAINER_TOKEN del entorno
     portainer_api_token: "{{ lookup('env','PORTAINER_TOKEN') | default(portainer_token | default(''), true) }}"
 
   pre_tasks:
@@ -78,9 +77,9 @@
       loop_control:
         loop_var: st
       vars:
-        # pasar SIEMPRE con nombres diferentes a los usados arriba
-        portainer_url: "{{ portainer_url_effective }}"
-        portainer_api_token: "{{ portainer_api_token }}"
-        portainer_validate_certs: "{{ portainer_validate_certs }}"
+        # usar nombres distintos para evitar auto-referencias
+        p_url: "{{ portainer_url_effective }}"
+        p_api_token: "{{ portainer_api_token }}"
+        p_validate_certs: "{{ portainer_validate_certs }}"
         endpoints_by_name_map: "{{ __endpoints_by_name }}"
         alias_map: "{{ __alias_map }}"

@@ -24,7 +24,7 @@
       {%- elif _endpoint | string | length > 0 -%}
         {%- set e = _endpoint -%}
         {%- set alias = alias_map.get(e, e) -%}
-        {{ endpoints_by_name_map.get(alias) | default(endpoints_by_name_map.get(e)) | default('') }}
+        {{ endpoints_by_name_map.get(alias) | default(endpoints_by_name_map.get(e)) | default('')) }}
       {%- else -%}
         {{ endpoints_by_name_map.get('local') | default('') }}
       {%- endif -%}
@@ -37,11 +37,11 @@
 # ----- Buscar stack existente -----
 - name: Fetch stacks list
   ansible.builtin.uri:
-    url: "{{ portainer_url }}/api/stacks"
+    url: "{{ p_url }}/api/stacks"
     method: GET
     headers:
-      X-API-Key: "{{ portainer_api_token }}"
-    validate_certs: "{{ portainer_validate_certs }}"
+      X-API-Key: "{{ p_api_token }}"
+    validate_certs: "{{ p_validate_certs }}"
     status_code: 200
     return_content: true
   register: _stacks
@@ -55,12 +55,12 @@
 - name: Create stack {{ st.name }} from repository (compose/standalone)
   when: _existing_stack_id is not defined
   ansible.builtin.uri:
-    url: "{{ portainer_url }}/api/stacks/create?type=2&method=repository&endpointId={{ _endpoint_id_resolved }}"
+    url: "{{ p_url }}/api/stacks/create?type=2&method=repository&endpointId={{ _endpoint_id_resolved }}"
     method: POST
     headers:
-      X-API-Key: "{{ portainer_api_token }}"
+      X-API-Key: "{{ p_api_token }}"
       Content-Type: "application/json"
-    validate_certs: "{{ portainer_validate_certs }}"
+    validate_certs: "{{ p_validate_certs }}"
     status_code: 200, 201
     body_format: json
     body:
@@ -76,12 +76,12 @@
 - name: Update git reference / file path (optional) on existing stack {{ st.name }}
   when: _existing_stack_id is defined and (_git_ref is defined or _file_path is defined)
   ansible.builtin.uri:
-    url: "{{ portainer_url }}/api/stacks/{{ _existing_stack_id }}"
+    url: "{{ p_url }}/api/stacks/{{ _existing_stack_id }}"
     method: PUT
     headers:
-      X-API-Key: "{{ portainer_api_token }}"
+      X-API-Key: "{{ p_api_token }}"
       Content-Type: "application/json"
-    validate_certs: "{{ portainer_validate_certs }}"
+    validate_certs: "{{ p_validate_certs }}"
     status_code: 200
     body_format: json
     body:
@@ -93,12 +93,12 @@
 - name: Git redeploy (pull & prune) existing stack {{ st.name }}
   when: _existing_stack_id is defined
   ansible.builtin.uri:
-    url: "{{ portainer_url }}/api/stacks/{{ _existing_stack_id }}/git/redeploy?endpointId={{ _endpoint_id_resolved }}"
+    url: "{{ p_url }}/api/stacks/{{ _existing_stack_id }}/git/redeploy?endpointId={{ _endpoint_id_resolved }}"
     method: POST
     headers:
-      X-API-Key: "{{ portainer_api_token }}"
+      X-API-Key: "{{ p_api_token }}"
       Content-Type: "application/json"
-    validate_certs: "{{ portainer_validate_certs }}"
+    validate_certs: "{{ p_validate_certs }}"
     status_code: 200
     body_format: json
     body:
