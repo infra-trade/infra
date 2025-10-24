@@ -7,6 +7,12 @@
 # - endpoint_id (int) → ya resuelto por el task que incluye este archivo
 # - Variables de workspace (_git_base, _repo_dir, _compose_abs, _compose_dir, _dotenv_abs) predefinidas por el resolver
 # - prefer_host_ssh_key (bool, opcional): por defecto true → usa ~/.ssh/id_ed25519
+# - portainer_http_timeout (int, opcional): timeout en segundos para llamadas a Portainer (def: 600)
+
+- name: Set default HTTP timeout for Portainer
+  ansible.builtin.set_fact:
+    portainer_http_timeout: "{{ portainer_http_timeout | default(600) }}"
+  run_once: true
 
 # ====== Preparación del workspace local ======
 - name: Definir carpetas locales (solo si no vienen predefinidas)
@@ -182,7 +188,6 @@
 # ====== Portainer: buscar stack existente por Name+EndpointId ======
 - name: Listar stacks en Portainer
   ansible.builtin.uri:
-    # EndpointId como entero (FIX al 400 invalid filters)
     url: "{{ portainer_url }}/api/stacks?filters={{ {'EndpointId': (endpoint_id | int)} | to_json | urlencode }}"
     method: GET
     headers:
@@ -190,6 +195,7 @@
     validate_certs: "{{ portainer_validate_certs | default(false) }}"
     return_content: true
     status_code: 200
+    timeout: "{{ portainer_http_timeout }}"
   register: _stacks_list
 
 - name: Calcular si el stack existe en el endpoint
@@ -205,48 +211,91 @@
       - "StackId={{ _stack_id | default('N/A') }}"
 
 # ====== Crear o actualizar ======
-- name: Crear stack (POST /create/standalone/string)
-  ansible.builtin.uri:
-    url: "{{ portainer_url }}/api/stacks/create/standalone/string?endpointId={{ endpoint_id }}"
-    method: POST
-    headers:
-      X-API-Key: "{{ portainer_api_token }}"
-    validate_certs: "{{ portainer_validate_certs | default(false) }}"
-    body_format: json
-    body:
-      Name: "{{ st.name }}"
-      StackFileContent: "{{ _compose_text }}"
-      Env: "{{ _env_final | default([]) }}"
-      Prune: true
-    status_code: [200,201]
-    return_content: true
-  when: not _exists
-  register: _create_resp
+- name: Crear/Actualizar stack con fallback por timeout
+  block:
+    - name: Crear stack (POST /create/standalone/string)
+      ansible.builtin.uri:
+        url: "{{ portainer_url }}/api/stacks/create/standalone/string?endpointId={{ endpoint_id }}"
+        method: POST
+        headers:
+          X-API-Key: "{{ portainer_api_token }}"
+        validate_certs: "{{ portainer_validate_certs | default(false) }}"
+        body_format: json
+        body:
+          Name: "{{ st.name }}"
+          StackFileContent: "{{ _compose_text }}"
+          Env: "{{ _env_final | default([]) }}"
+          Prune: true
+        status_code: [200,201]
+        return_content: true
+        timeout: "{{ portainer_http_timeout }}"
+      when: not _exists
+      register: _create_resp
 
-- name: Actualizar stack existente (PUT /stacks/{id})
-  ansible.builtin.uri:
-    url: "{{ portainer_url }}/api/stacks/{{ _stack_id }}?endpointId={{ endpoint_id }}"
-    method: PUT
-    headers:
-      X-API-Key: "{{ portainer_api_token }}"
-    validate_certs: "{{ portainer_validate_certs | default(false) }}"
-    body_format: json
-    body:
-      Prune: true
-      StackFileContent: "{{ _compose_text }}"
-      Env: "{{ _env_final | default([]) }}"
-    status_code: 200
-    return_content: true
-  when: _exists
-  register: _update_resp
+    - name: Actualizar stack existente (PUT /stacks/{id})
+      ansible.builtin.uri:
+        url: "{{ portainer_url }}/api/stacks/{{ _stack_id }}?endpointId={{ endpoint_id }}"
+        method: PUT
+        headers:
+          X-API-Key: "{{ portainer_api_token }}"
+        validate_certs: "{{ portainer_validate_certs | default(false) }}"
+        body_format: json
+        body:
+          Prune: true
+          StackFileContent: "{{ _compose_text }}"
+          Env: "{{ _env_final | default([]) }}"
+        status_code: 200
+        return_content: true
+        timeout: "{{ portainer_http_timeout }}"
+      when: _exists
+      register: _update_resp
+
+  rescue:
+    # Si hubo timeout (-1) u otro error, re-consultar para ver si el stack quedó creado/actualizado
+    - name: Re-chequear stacks tras error/timeout
+      ansible.builtin.uri:
+        url: "{{ portainer_url }}/api/stacks?filters={{ {'EndpointId': (endpoint_id | int)} | to_json | urlencode }}"
+        method: GET
+        headers:
+          X-API-Key: "{{ portainer_api_token }}"
+        validate_certs: "{{ portainer_validate_certs | default(false) }}"
+        return_content: true
+        status_code: 200
+        timeout: "{{ portainer_http_timeout }}"
+      register: _stacks_list_after
+
+    - name: Recalcular existencia tras timeout
+      ansible.builtin.set_fact:
+        _matching_after: "{{ _stacks_list_after.json | selectattr('Name','equalto', st.name) | list }}"
+        _exists_after: "{{ (_stacks_list_after.json | selectattr('Name','equalto', st.name) | list | length) > 0 }}"
+        _stack_id_after: "{{ (_stacks_list_after.json | selectattr('Name','equalto', st.name) | list | first).Id if (_stacks_list_after.json | selectattr('Name','equalto', st.name) | list | length)>0 else 0 }}"
+
+    - name: Continuar si el stack aparece creado/actualizado
+      ansible.builtin.debug:
+        msg:
+          - "Post-timeout: stack '{{ st.name }}' detectado con id={{ _stack_id_after }}"
+      when: _exists_after | bool
+
+    - name: Fallar si realmente no se creó/actualizó
+      ansible.builtin.fail:
+        msg: >-
+          Falló la creación/actualización del stack '{{ st.name }}' (endpoint {{ endpoint_id }}).
+          Revisa conectividad hacia el agente, logs de Portainer y el contenido del compose.
+      when: not _exists_after | bool
 
 - name: Resultado
   ansible.builtin.debug:
     msg: >-
       {{
-        _exists
+        (_exists | default(false))
         | ternary(
-            'Actualizado stack ' ~ st.name ~ ' (id=' ~ _stack_id | string ~ ')',
-            'Creado stack ' ~ st.name ~ ' (id=' ~ (_create_resp.json.Id | default("desconocido")) | string ~ ')'
+            'Actualizado stack ' ~ st.name ~ ' (id=' ~ (_stack_id | string) ~ ')',
+            (
+              (_create_resp.json.Id | default(_stack_id_after | default('desconocido'))) is string
+              | ternary(
+                  'Creado/confirmado stack ' ~ st.name ~ ' (id=' ~ (_stack_id_after | string) ~ ')',
+                  'Creado stack ' ~ st.name ~ ' (id=' ~ (_create_resp.json.Id | default("desconocido") | string) ~ ')'
+                )
+            )
           )
       }}
