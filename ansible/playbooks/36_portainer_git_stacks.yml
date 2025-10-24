@@ -11,9 +11,8 @@
       kafka: kafka-core
       spark: spark-core
       db: db-core
-    # ¡OJO! No definas 'stacks' aquí.
-
     portainer_api_token: "{{ lookup('env','PORTAINER_TOKEN') | default(portainer_token | default(''), true) }}"
+    # OJO: no definas 'stacks' aquí.
 
   pre_tasks:
     - name: Build effective Portainer URL (avoid self-recursion)
@@ -50,7 +49,8 @@
       ansible.builtin.set_fact:
         endpoints_by_name: "{{ dict( (_endpoints.json | map(attribute='Name') | list) | zip(_endpoints.json | map(attribute='Id') | list) ) }}"
         endpoints_list: "{{ _endpoints.json | json_query('[].{Id: Id, Name: Name, URL: URL, PublicURL: PublicURL, Type: Type}') }}"
-        endpoint_aliases_effective: "{{ endpoint_aliases_default | combine(endpoint_aliases | default({}), recursive=True) }}"
+        # 👇 usamos un nombre que no exista en tu inventario
+        aliases_effective: "{{ endpoint_aliases_default | combine(endpoint_aliases | default({}), recursive=True) }}"
 
     - name: Load stacks (from group_vars or -e) into stacks_effective
       ansible.builtin.set_fact:
@@ -60,9 +60,7 @@
       ansible.builtin.assert:
         that:
           - stacks_effective | length > 0
-        fail_msg: >
-          No se encontró 'stacks'. Define stacks en group_vars/mon-core.yml
-          o pásalas por -e 'stacks=[{...}]'.
+        fail_msg: "No se encontró 'stacks'. Define en group_vars/mon-core.yml o pásalas por -e."
 
     - name: Show detected endpoints (audit)
       ansible.builtin.debug:
@@ -79,4 +77,5 @@
         portainer_api_token: "{{ portainer_api_token }}"
         portainer_validate_certs: "{{ portainer_validate_certs }}"
         endpoints_by_name: "{{ endpoints_by_name }}"
-        endpoint_aliases_effective: "{{ endpoint_aliases_effective }}"
+        # 👇 pasamos aliases_effective en lugar del viejo nombre
+        aliases_effective: "{{ aliases_effective }}"

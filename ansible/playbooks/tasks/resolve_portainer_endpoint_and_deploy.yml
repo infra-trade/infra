@@ -21,7 +21,7 @@
       {{ st.endpoint_id }}
       {%- elif st.endpoint is defined -%}
         {%- set e = st.endpoint -%}
-        {%- set alias = endpoint_aliases_effective.get(e, e) -%}
+        {%- set alias = aliases_effective.get(e, e) -%}
         {{ endpoints_by_name.get(alias) | default(endpoints_by_name.get(e)) | default('') }}
       {%- else -%}
       {{ endpoints_by_name.get('local') | default('') }}
