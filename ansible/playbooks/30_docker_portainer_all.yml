@@ -200,12 +200,13 @@
         state: link
       when: need_manual_compose | default(false)
 
+    # <<< FIX: ejecutar systemd sin depender de ansible_facts.services >>>
     - name: Enable & start docker
       systemd:
         name: docker
         enabled: true
         state: started
-      when: "'docker' in ansible_facts.services or 'docker.service' in ansible_facts.services | default({})"
+        daemon_reload: true
 
     - name: Add 'ansible' to docker group (si existe)
       user:
