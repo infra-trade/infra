@@ -1,27 +1,41 @@
 ---
-# =====================================================================
-# 30_docker_portainer_all.yml
-# - Instala/actualiza Docker Engine y plugin compose en TODOS los hosts
-# - Despliega/actualiza Portainer CE en mon-core (HTTPS 9443)
-# - Despliega/actualiza Portainer Agent en el resto de nodos
+# =============================================================================
+# Install/Upgrade Docker Engine (Ubuntu 22.04+) + compose plugin
+# Deploy/Upgrade Portainer CE (monitor) + Portainer Agent (todos)
 #
-# Requiere:
-# - group_vars/all.yml con:
-#     portainer_image: "portainer/portainer-ce:2.21.5"
-#     agent_image:     "portainer/agent:2.21.5"
-# =====================================================================
+# Requiere variables en group_vars/all.yml:
+#   portainer_image: "portainer/portainer-ce:2.21.5"
+#   agent_image:     "portainer/agent:2.21.5"
+#
+# Notas:
+# - La GPG de Docker se descarga una vez en el controlador y se copia a los hosts.
+# - Si docker-ce no está disponible (repo no válido o no soportado), se cae a docker.io.
+# =============================================================================
 
 - name: Install/Upgrade Docker Engine (Ubuntu 22.04+) + compose plugin
-  hosts: all
+  hosts: airflow-core,kafka-core,spark-core,db-core,mon-core
   become: true
   gather_facts: true
-  collections:
-    - community.docker
+
   vars:
-    docker_keyring_path: /etc/apt/keyrings/docker.gpg
-  tasks:
+    docker_repo_url: "https://download.docker.com/linux/ubuntu"
+    docker_key_dst: "/etc/apt/keyrings/docker.gpg"
+    docker_repo_file: "/etc/apt/sources.list.d/docker.list"
+    # Paquetes oficiales del repo de Docker
+    docker_repo_packages:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-buildx-plugin
+      - docker-compose-plugin
+    # Fallback desde Ubuntu (sin repo de Docker)
+    docker_ubuntu_packages:
+      - docker.io
+      - docker-compose-plugin
+
+  pre_tasks:
     - name: Ensure prereqs (curl, gnupg, lsb-release, ca-certificates)
-      ansible.builtin.apt:
+      apt:
         name:
           - curl
           - gnupg
@@ -30,8 +44,9 @@
         state: present
         update_cache: false
 
+    # Limpieza de llaves viejas en cada host
     - name: Remove old docker keys in trusted.gpg.d (cleanup)
-      ansible.builtin.file:
+      file:
         path: "{{ item }}"
         state: absent
       loop:
@@ -39,182 +54,229 @@
         - /etc/apt/trusted.gpg.d/docker.asc
         - /etc/apt/trusted.gpg.d/download.docker.com.gpg
 
-    - name: Remove previous docker keyring (if any)
-      ansible.builtin.file:
-        path: "{{ docker_keyring_path }}"
-        state: absent
+    # Descargar la GPG en el controlador y distribuir
+    - name: Download Docker GPG (ASCII) to controller /tmp
+      delegate_to: localhost
+      run_once: true
+      get_url:
+        url: "{{ docker_repo_url }}/gpg"
+        dest: "/tmp/docker.asc"
+        mode: "0644"
+        validate_certs: true
+      register: docker_gpg_ctrl
 
-    - name: Download Docker GPG (ASCII) to tmp
-      ansible.builtin.get_url:
-        url: https://download.docker.com/linux/ubuntu/gpg
-        dest: /tmp/docker.asc
+    - name: Ensure /etc/apt/keyrings exists
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Copy docker.asc to remote tmp
+      copy:
+        src: "/tmp/docker.asc"
+        dest: "/tmp/docker.asc"
         mode: "0644"
 
+    - name: Remove previous docker keyring (if any)
+      file:
+        path: "{{ docker_key_dst }}"
+        state: absent
+
     - name: Convert Docker GPG to dearmored keyring
-      ansible.builtin.command:
-        cmd: "gpg --dearmor -o {{ docker_keyring_path }} /tmp/docker.asc"
+      shell: |
+        gpg --dearmor < /tmp/docker.asc > "{{ docker_key_dst }}"
       args:
-        creates: "{{ docker_keyring_path }}"
+        creates: "{{ docker_key_dst }}"
 
     - name: Set permissions on keyring
-      ansible.builtin.file:
-        path: "{{ docker_keyring_path }}"
+      file:
+        path: "{{ docker_key_dst }}"
         mode: "0644"
 
     - name: Detect Ubuntu codename
-      ansible.builtin.command: bash -lc "source /etc/os-release && echo ${VERSION_CODENAME}"
-      register: ubuntu_codename
-      changed_when: false
+      set_fact:
+        ubuntu_codename: "{{ ansible_facts.lsb.codename | default('jammy') }}"
+        arch_deb: "{{ ansible_facts.architecture | default('amd64') }}"
 
     - name: Write Docker apt repo (codename + signed-by)
-      ansible.builtin.copy:
-        dest: /etc/apt/sources.list.d/docker.list
+      copy:
+        dest: "{{ docker_repo_file }}"
         mode: "0644"
         content: |
-          deb [arch={{ ansible_architecture | default('amd64') }} signed-by={{ docker_keyring_path }}] https://download.docker.com/linux/ubuntu {{ ubuntu_codename.stdout | trim }} stable
+          deb [arch={{ arch_deb }} signed-by={{ docker_key_dst }}] {{ docker_repo_url }} {{ ubuntu_codename }} stable
 
     - name: Ensure timesync (helps apt signatures)
-      ansible.builtin.package:
+      package:
         name: systemd-timesyncd
         state: present
 
     - name: Start & enable timesyncd
-      ansible.builtin.service:
+      systemd:
         name: systemd-timesyncd
         state: started
         enabled: true
 
     - name: apt-get update (refresh cache)
-      ansible.builtin.apt:
+      apt:
         update_cache: true
-        cache_valid_time: 3600
 
-    - name: Install Docker Engine stack (idempotent)
-      ansible.builtin.apt:
-        name:
-          - docker-ce
-          - docker-ce-cli
-          - containerd.io
-          - docker-buildx-plugin
-          - docker-compose-plugin
+  tasks:
+    # Intento principal: instalar docker desde el repo de Docker
+    - name: Check if docker-ce candidate exists
+      shell: |
+        set -o pipefail
+        apt-cache policy docker-ce | awk '/Candidate:/ {print $2}'
+      args:
+        executable: /bin/bash
+      register: docker_ce_candidate
+      changed_when: false
+
+    - name: Install Docker Engine stack (Docker repo) if candidate available
+      apt:
+        name: "{{ docker_repo_packages }}"
         state: present
+      when:
+        - docker_ce_candidate.stdout is defined
+        - docker_ce_candidate.stdout != "(none)"
+
+    # Fallback si el repo de Docker no tiene paquetes (o arquitectura/codename no soportado)
+    - name: Install Docker (Ubuntu fallback) if docker-ce not available
+      apt:
+        name: "{{ docker_ubuntu_packages }}"
+        state: present
+        update_cache: true
+      when:
+        - docker_ce_candidate.stdout is not defined
+          or docker_ce_candidate.stdout == "(none)"
 
     - name: Enable & start docker
-      ansible.builtin.service:
+      systemd:
         name: docker
         state: started
         enabled: true
+        daemon_reload: true
 
     - name: Add 'ansible' to docker group (si existe)
-      ansible.builtin.user:
+      user:
         name: ansible
         groups: docker
         append: true
-      when: ansible_facts.getent_passwd is not defined or 'ansible' in ansible_facts.getent_passwd | default({})
+      ignore_errors: true
 
     - name: Show docker and compose version
-      ansible.builtin.shell: |
+      shell: |
         set -e
         docker --version
         docker compose version
       register: docker_versions
       changed_when: false
+      failed_when: false
 
     - name: Versions output
-      ansible.builtin.debug:
+      debug:
         var: docker_versions.stdout_lines
 
-# ---------------------------------------------------------------------
+# =============================================================================
 
 - name: Deploy/Upgrade Portainer Server (CE) on monitor
   hosts: mon-core
   become: true
   gather_facts: false
-  collections:
-    - community.docker
+
   vars:
-    # No autoreferencias. Si no viene desde group_vars, usamos defaults seguros:
-    portainer_image_effective: "{{ portainer_image | default('portainer/portainer-ce:2.21.5') }}"
-    portainer_data_volume: portainer_data
+    portainer_data: "portainer_data"
+    portainer_http_port: 9000
+    portainer_https_port: 9443
+
   tasks:
     - name: Ensure docker is running
-      ansible.builtin.service:
+      systemd:
         name: docker
         state: started
         enabled: true
 
     - name: Ensure Portainer data volume exists
       community.docker.docker_volume:
-        name: "{{ portainer_data_volume }}"
+        name: "{{ portainer_data }}"
         state: present
 
     - name: Pull pinned Portainer CE image
       community.docker.docker_image:
-        name: "{{ portainer_image_effective }}"
+        name: "{{ portainer_image }}"
         source: pull
 
     - name: Run/Update Portainer CE container
       community.docker.docker_container:
         name: portainer
-        image: "{{ portainer_image_effective }}"
-        state: started
+        image: "{{ portainer_image }}"
         restart_policy: always
+        state: started
         recreate: true
-        pull: false
         ports:
-          - "8000:8000"     # Edge agent tunnel (opcional)
-          - "9443:9443"     # HTTPS UI/API
+          - "{{ portainer_http_port }}:9000"
+          - "{{ portainer_https_port }}:9443"
         volumes:
-          - "{{ portainer_data_volume }}:/data"
           - "/var/run/docker.sock:/var/run/docker.sock"
-        command: >-
-          --ssl
-        healthcheck:
-          test: ["CMD", "curl", "-kfsS", "https://localhost:9443/api/status"]
-          interval: 30s
-          timeout: 5s
-          retries: 5
-          start_period: 30s
-        labels:
-          io.portainer.description: "Portainer CE - UI de gestión Docker"
-          io.portainer.maintained_by: "ansible"
+          - "{{ portainer_data }}:/data"
 
-# ---------------------------------------------------------------------
+# =============================================================================
 
 - name: Deploy/Upgrade Portainer Agent on all agent nodes
-  hosts: "all:!mon-core"
+  hosts: airflow-core,kafka-core,spark-core,db-core
   become: true
   gather_facts: false
-  collections:
-    - community.docker
+
   vars:
-    agent_image_effective: "{{ agent_image | default('portainer/agent:2.21.5') }}"
+    agent_port: 9001
+
   tasks:
     - name: Ensure docker is running
-      ansible.builtin.service:
+      systemd:
         name: docker
         state: started
         enabled: true
 
     - name: Pull pinned Portainer Agent image
       community.docker.docker_image:
-        name: "{{ agent_image_effective }}"
+        name: "{{ agent_image }}"
         source: pull
 
-    - name: Run/Update Portainer Agent container
+    # Intento de arrancar publicado. Si el puerto está ocupado, intenta sin publicar (bridge)
+    - name: Run/Update Portainer Agent container (try with published port)
       community.docker.docker_container:
         name: portainer-agent
-        image: "{{ agent_image_effective }}"
-        state: started
+        image: "{{ agent_image }}"
         restart_policy: always
+        state: started
         recreate: true
-        pull: false
         ports:
-          - "9001:9001"
+          - "{{ agent_port }}:9001"
         env:
-          AGENT_CLUSTER_ADDR: "tasks.portainer-agent"
+          AGENT_CLUSTER_ADDR: tasks.agent
+          LOG_LEVEL: INFO
         volumes:
           - "/var/run/docker.sock:/var/run/docker.sock"
           - "/var/lib/docker/volumes:/var/lib/docker/volumes"
-        labels:
-          io.portainer.agent: "true"
+      register: agent_with_port
+      failed_when: false
+
+    - name: Remove failed container (if any) before fallback
+      community.docker.docker_container:
+        name: portainer-agent
+        state: absent
+      when: agent_with_port.failed | default(false)
+
+    - name: Run/Update Portainer Agent container (fallback without published port)
+      community.docker.docker_container:
+        name: portainer-agent
+        image: "{{ agent_image }}"
+        restart_policy: always
+        state: started
+        recreate: true
+        env:
+          AGENT_CLUSTER_ADDR: tasks.agent
+          LOG_LEVEL: INFO
+        volumes:
+          - "/var/run/docker.sock:/var/run/docker.sock"
+          - "/var/lib/docker/volumes:/var/lib/docker/volumes"
+      when: agent_with_port.failed | default(false)
