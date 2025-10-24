@@ -1,11 +1,4 @@
-version: "3.8"
-
+# ejemplo genérico (ajústalo por VM)
 services:
-  hola:
-    image: python:3.12-alpine
-    container_name: hola_mundo
-    command: >
-      sh -c "echo 'Hola Mundo' > index.html && python -m http.server 8080"
-    ports:
-      - "8080:8080"
-    restart: unless-stopped
+  hello:
+    image: hello-world
