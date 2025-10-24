@@ -1,34 +1,28 @@
 ---
-# =============================================================================
-# Install/Upgrade Docker Engine (Ubuntu 22.04+) + compose plugin
-# Deploy/Upgrade Portainer CE (monitor) + Portainer Agent (todos)
-# =============================================================================
+# playbooks/30_docker_portainer_all.yml
+# Instala/actualiza Docker Engine y Docker Compose v2 (con fallback manual),
+# y despliega Portainer CE en el nodo monitor + Portainer Agent en el resto.
 
+############################
+# Play 1: Docker en todos
+############################
 - name: Install/Upgrade Docker Engine (Ubuntu 22.04+) + compose plugin
-  hosts: airflow-core,kafka-core,spark-core,db-core,mon-core
+  hosts: all
   become: true
-  gather_facts: true
+  gather_facts: yes
 
   vars:
-    # ---- Docker repo / keyring
-    docker_repo_url: "https://download.docker.com/linux/ubuntu"
-    docker_key_dst: "/etc/apt/keyrings/docker.gpg"
-    docker_repo_file: "/etc/apt/sources.list.d/docker.list"
-
-    # Paquetes del repo oficial de Docker
-    docker_repo_packages:
-      - docker-ce
-      - docker-ce-cli
-      - containerd.io
-      - docker-buildx-plugin
-      - docker-compose-plugin
-
-    # Fallback desde Ubuntu (requiere 'universe' para docker-compose-plugin; si no existe, haremos install manual)
-    docker_ubuntu_packages:
-      - docker.io
-
-    # Versión de Docker Compose (para instalación manual si fuese necesario)
+    # Versión de Compose para el fallback manual (binario oficial de GitHub)
     compose_version: "v2.40.2"
+
+    # Map para resolver arquitectura del binario de compose
+    compose_arch_map:
+      x86_64: "x86_64"
+      aarch64: "aarch64"
+      armv7l: "armv7"
+
+    # Ruta del keyring de Docker
+    docker_keyring_path: /etc/apt/keyrings/docker.gpg
 
   pre_tasks:
     - name: Ensure prereqs (curl, gnupg, lsb-release, ca-certificates, software-properties-common)
@@ -40,13 +34,13 @@
           - ca-certificates
           - software-properties-common
         state: present
-        update_cache: false
+        update_cache: yes
 
     - name: Enable 'universe' component (idempotent)
       command: add-apt-repository -y universe
       register: add_universe
-      changed_when: add_universe.rc == 0
-      failed_when: add_universe.rc not in [0]
+      changed_when: "'enabled' in add_universe.stdout or add_universe.rc == 0"
+      failed_when: false
 
     - name: Remove old docker keys in trusted.gpg.d (cleanup)
       file:
@@ -57,14 +51,14 @@
         - /etc/apt/trusted.gpg.d/docker.asc
         - /etc/apt/trusted.gpg.d/download.docker.com.gpg
 
+    # --- Descargar la GPG de Docker una sola vez en el controlador ---
     - name: Download Docker GPG (ASCII) to controller /tmp
+      get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /tmp/docker.asc
+        mode: "0644"
       delegate_to: localhost
       run_once: true
-      get_url:
-        url: "{{ docker_repo_url }}/gpg"
-        dest: "/tmp/docker.asc"
-        mode: "0644"
-        validate_certs: true
 
     - name: Ensure /etc/apt/keyrings exists
       file:
@@ -74,41 +68,35 @@
 
     - name: Copy docker.asc to remote tmp
       copy:
-        src: "/tmp/docker.asc"
-        dest: "/tmp/docker.asc"
+        src: /tmp/docker.asc
+        dest: /tmp/docker.asc
         mode: "0644"
 
     - name: Remove previous docker keyring (if any)
       file:
-        path: "{{ docker_key_dst }}"
+        path: "{{ docker_keyring_path }}"
         state: absent
 
     - name: Convert Docker GPG to dearmored keyring
-      shell: |
-        gpg --dearmor < /tmp/docker.asc > "{{ docker_key_dst }}"
-      args:
-        creates: "{{ docker_key_dst }}"
+      command: "gpg --dearmor -o {{ docker_keyring_path }} /tmp/docker.asc"
 
     - name: Set permissions on keyring
       file:
-        path: "{{ docker_key_dst }}"
+        path: "{{ docker_keyring_path }}"
         mode: "0644"
 
     - name: Detect Ubuntu codename and arch
       set_fact:
-        ubuntu_codename: "{{ ansible_facts.lsb.codename | default('jammy') }}"
-        arch_deb: "{{ ansible_facts.architecture | default('amd64') }}"
-        compose_arch: >-
-          {{ 'x86_64' if ansible_facts.architecture in ['x86_64','amd64'] else
-             'aarch64' if ansible_facts.architecture in ['aarch64','arm64'] else
-             ansible_facts.architecture }}
+        ubuntu_codename: "{{ ansible_distribution_release }}"
+        deb_arch: "{{ 'arm64' if ansible_architecture in ['aarch64'] else 'amd64' }}"
+        compose_arch: "{{ compose_arch_map.get(ansible_architecture, 'x86_64') }}"
 
     - name: Write Docker apt repo (codename + signed-by)
       copy:
-        dest: "{{ docker_repo_file }}"
+        dest: /etc/apt/sources.list.d/docker.list
         mode: "0644"
         content: |
-          deb [arch={{ arch_deb }} signed-by={{ docker_key_dst }}] {{ docker_repo_url }} {{ ubuntu_codename }} stable
+          deb [arch={{ deb_arch }} signed-by={{ docker_keyring_path }}] https://download.docker.com/linux/ubuntu {{ ubuntu_codename }} stable
 
     - name: Ensure timesync (helps apt signatures)
       package:
@@ -118,14 +106,15 @@
     - name: Start & enable timesyncd
       systemd:
         name: systemd-timesyncd
-        state: started
         enabled: true
+        state: started
 
     - name: apt-get update (refresh cache)
       apt:
-        update_cache: true
+        update_cache: yes
 
   tasks:
+    # --- Intento 1: instalar desde repo oficial de Docker ---
     - name: Check if docker-ce candidate exists
       shell: |
         set -o pipefail
@@ -137,22 +126,27 @@
 
     - name: Install Docker Engine stack (Docker repo) if candidate available
       apt:
-        name: "{{ docker_repo_packages }}"
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
         state: present
       when:
         - docker_ce_candidate.stdout is defined
         - docker_ce_candidate.stdout != "(none)"
+      register: docker_ce_install
 
-    # Fallback: docker.io + (compose plugin por APT si existe, si no, instalación manual)
+    # --- Intento 2 (fallback): instalar desde Ubuntu (docker.io) ---
     - name: Install Docker (Ubuntu fallback) if docker-ce not available
       apt:
-        name: "{{ docker_ubuntu_packages }}"
+        name:
+          - docker.io
         state: present
-        update_cache: true
       when:
-        - docker_ce_candidate.stdout is not defined
-          or docker_ce_candidate.stdout == "(none)"
+        - docker_ce_candidate.stdout is not defined or docker_ce_candidate.stdout == "(none)"
+      register: docker_io_install
 
+    # --- Compose v2: intentar plugin de Ubuntu si Docker vino por Ubuntu ---
     - name: Check if docker-compose-plugin candidate exists (fallback path)
       shell: |
         set -o pipefail
@@ -162,93 +156,89 @@
       register: compose_candidate
       changed_when: false
       when:
-        - docker_ce_candidate.stdout is not defined
-          or docker_ce_candidate.stdout == "(none)"
+        - docker_ce_candidate.stdout is not defined or docker_ce_candidate.stdout == "(none)"
 
-    - name: Install docker-compose-plugin from Ubuntu (if available)
+    - name: Try install docker-compose-plugin from Ubuntu (if candidate visible)
       apt:
         name: docker-compose-plugin
         state: present
+      register: compose_plugin_install
+      failed_when: false
       when:
-        - docker_ce_candidate.stdout is not defined
-          or docker_ce_candidate.stdout == "(none)"
+        - docker_ce_candidate.stdout is not defined or docker_ce_candidate.stdout == "(none)"
         - compose_candidate.stdout is defined
-        - compose_candidate.stdout != "(none)"
+
+    - name: Decide manual compose install is needed
+      set_fact:
+        need_manual_compose: >-
+          {{ (docker_ce_candidate.stdout is not defined or docker_ce_candidate.stdout == "(none)") and
+             (
+               (compose_candidate.stdout is not defined) or
+               (compose_candidate.stdout == "(none)") or
+               (compose_plugin_install is defined and compose_plugin_install.rc is defined and compose_plugin_install.rc != 0)
+             )
+          }}
 
     - name: Ensure cli-plugins dir exists for manual compose
       file:
         path: /usr/local/lib/docker/cli-plugins
         state: directory
         mode: "0755"
-      when:
-        - docker_ce_candidate.stdout is not defined
-          or docker_ce_candidate.stdout == "(none)"
-        - compose_candidate.stdout is not defined
-          or compose_candidate.stdout == "(none)"
+      when: need_manual_compose | default(false)
 
-    - name: Manual install Docker Compose v2 (when plugin not in APT)
+    - name: Manual install Docker Compose v2 (when plugin not in APT or install failed)
       get_url:
         url: "https://github.com/docker/compose/releases/download/{{ compose_version }}/docker-compose-linux-{{ compose_arch }}"
         dest: /usr/local/lib/docker/cli-plugins/docker-compose
         mode: "0755"
-      when:
-        - docker_ce_candidate.stdout is not defined
-          or docker_ce_candidate.stdout == "(none)"
-        - compose_candidate.stdout is not defined
-          or compose_candidate.stdout == "(none)"
+      when: need_manual_compose | default(false)
 
     - name: Symlink legacy docker-compose (optional)
       file:
         src: /usr/local/lib/docker/cli-plugins/docker-compose
         dest: /usr/local/bin/docker-compose
         state: link
-      when:
-        - docker_ce_candidate.stdout is not defined
-          or docker_ce_candidate.stdout == "(none)"
-        - compose_candidate.stdout is not defined
-          or compose_candidate.stdout == "(none)"
+      when: need_manual_compose | default(false)
 
     - name: Enable & start docker
       systemd:
         name: docker
-        state: started
         enabled: true
-        daemon_reload: true
+        state: started
+      when: "'docker' in ansible_facts.services or 'docker.service' in ansible_facts.services | default({})"
 
     - name: Add 'ansible' to docker group (si existe)
       user:
         name: ansible
         groups: docker
         append: true
-      ignore_errors: true
+      when: ansible_facts.getent_passwd is not defined or ansible_facts.getent_passwd.ansible is defined
 
     - name: Show docker and compose version
       shell: |
-        set -e
-        docker --version
-        docker compose version || true
-        docker-compose --version || true
+        set -o pipefail
+        docker --version && docker compose version
+      args:
+        executable: /bin/bash
       register: docker_versions
       changed_when: false
-      failed_when: false
 
     - name: Versions output
       debug:
         var: docker_versions.stdout_lines
 
-# =============================================================================
-
+##############################################
+# Play 2: Portainer Server en el nodo monitor
+##############################################
 - name: Deploy/Upgrade Portainer Server (CE) on monitor
   hosts: mon-core
   become: true
-  gather_facts: false
+  gather_facts: yes
 
   vars:
-    # usar variable de group_vars si existe; si no, fallback seguro
-    portainer_image_final: "{{ (hostvars[inventory_hostname].portainer_image | default('portainer/portainer-ce:2.21.5')) }}"
-    portainer_data: "portainer_data"
-    portainer_http_port: 9000
-    portainer_https_port: 9443
+    # Usa la variable global si existe; si no, este default:
+    portainer_image_effective: "{{ portainer_image | default('portainer/portainer-ce:2.21.5') }}"
+    portainer_data_volume: "portainer_data"
 
   tasks:
     - name: Ensure docker is running
@@ -259,38 +249,42 @@
 
     - name: Ensure Portainer data volume exists
       community.docker.docker_volume:
-        name: "{{ portainer_data }}"
+        name: "{{ portainer_data_volume }}"
         state: present
 
     - name: Pull pinned Portainer CE image
       community.docker.docker_image:
-        name: "{{ portainer_image_final }}"
+        name: "{{ portainer_image_effective }}"
         source: pull
 
     - name: Run/Update Portainer CE container
       community.docker.docker_container:
         name: portainer
-        image: "{{ portainer_image_final }}"
-        restart_policy: always
+        image: "{{ portainer_image_effective }}"
         state: started
+        restart_policy: always
         recreate: true
-        ports:
-          - "{{ portainer_http_port }}:9000"
-          - "{{ portainer_https_port }}:9443"
+        privileged: true
         volumes:
+          - "{{ portainer_data_volume }}:/data"
           - "/var/run/docker.sock:/var/run/docker.sock"
-          - "{{ portainer_data }}:/data"
+        ports:
+          - "8000:8000"
+          - "9443:9443"
+        env:
+          TZ: "UTC"
+      register: portainer_server_run
 
-# =============================================================================
-
+######################################################
+# Play 3: Portainer Agent en todos menos el monitor
+######################################################
 - name: Deploy/Upgrade Portainer Agent on all agent nodes
-  hosts: airflow-core,kafka-core,spark-core,db-core
+  hosts: all:!mon-core
   become: true
-  gather_facts: false
+  gather_facts: yes
 
   vars:
-    agent_port: 9001
-    agent_image_final: "{{ (hostvars[inventory_hostname].agent_image | default('portainer/agent:2.21.5')) }}"
+    agent_image_effective: "{{ agent_image | default('portainer/agent:2.21.5') }}"
 
   tasks:
     - name: Ensure docker is running
@@ -301,44 +295,51 @@
 
     - name: Pull pinned Portainer Agent image
       community.docker.docker_image:
-        name: "{{ agent_image_final }}"
+        name: "{{ agent_image_effective }}"
         source: pull
 
+    # Intento 1: publicar 9001 (útil si conectas el server por TCP al agente)
     - name: Run/Update Portainer Agent container (try with published port)
       community.docker.docker_container:
         name: portainer-agent
-        image: "{{ agent_image_final }}"
-        restart_policy: always
+        image: "{{ agent_image_effective }}"
         state: started
+        restart_policy: always
         recreate: true
-        ports:
-          - "{{ agent_port }}:9001"
         env:
-          AGENT_CLUSTER_ADDR: tasks.agent
-          LOG_LEVEL: INFO
+          AGENT_CLUSTER_ADDR: tasks.portainer-agent
+          AGENT_SECRET: ""
         volumes:
           - "/var/run/docker.sock:/var/run/docker.sock"
           - "/var/lib/docker/volumes:/var/lib/docker/volumes"
-      register: agent_with_port
+        ports:
+          - "9001:9001"
+      register: agent_run_with_port
       failed_when: false
 
     - name: Remove failed container (if any) before fallback
       community.docker.docker_container:
         name: portainer-agent
         state: absent
-      when: agent_with_port.failed | default(false)
+        force_kill: true
+      when:
+        - agent_run_with_port is defined
+        - agent_run_with_port.failed | default(false)
 
+    # Intento 2 (fallback): sin publicar 9001 (evita conflicto "port already allocated")
     - name: Run/Update Portainer Agent container (fallback without published port)
       community.docker.docker_container:
         name: portainer-agent
-        image: "{{ agent_image_final }}"
-        restart_policy: always
+        image: "{{ agent_image_effective }}"
         state: started
+        restart_policy: always
         recreate: true
         env:
-          AGENT_CLUSTER_ADDR: tasks.agent
-          LOG_LEVEL: INFO
+          AGENT_CLUSTER_ADDR: tasks.portainer-agent
+          AGENT_SECRET: ""
         volumes:
           - "/var/run/docker.sock:/var/run/docker.sock"
           - "/var/lib/docker/volumes:/var/lib/docker/volumes"
-      when: agent_with_port.failed | default(false)
+      when:
+        - agent_run_with_port is defined
+        - agent_run_with_port.failed | default(false)
