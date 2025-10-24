@@ -210,7 +210,7 @@
       - "EndpointId={{ endpoint_id }} | Stack '{{ st.name }}' existe? {{ _exists }}"
       - "StackId={{ _stack_id | default('N/A') }}"
 
-# ====== Crear o actualizar ======
+# ====== Crear o actualizar (con fallback por timeout) ======
 - name: Crear/Actualizar stack con fallback por timeout
   block:
     - name: Crear stack (POST /create/standalone/string)
@@ -283,19 +283,32 @@
           Revisa conectividad hacia el agente, logs de Portainer y el contenido del compose.
       when: not _exists_after | bool
 
+# ====== Normalizar estado final para salida segura ======
+- name: Determinar estado final del stack (id/existencia)
+  ansible.builtin.set_fact:
+    _final_exists: "{{ (_exists | default(false)) or (_exists_after | default(false)) }}"
+    _final_stack_id: >-
+      {{
+        (_exists | default(false))
+        | ternary(
+            (_stack_id | default(0)),
+            (
+              (_exists_after | default(false))
+              | ternary(
+                  (_stack_id_after | default(0)),
+                  (_create_resp.json.Id | default(0))
+                )
+            )
+          )
+      }}
+
 - name: Resultado
   ansible.builtin.debug:
     msg: >-
       {{
-        (_exists | default(false))
+        _final_exists
         | ternary(
-            'Actualizado stack ' ~ st.name ~ ' (id=' ~ (_stack_id | string) ~ ')',
-            (
-              (_create_resp.json.Id | default(_stack_id_after | default('desconocido'))) is string
-              | ternary(
-                  'Creado/confirmado stack ' ~ st.name ~ ' (id=' ~ (_stack_id_after | string) ~ ')',
-                  'Creado stack ' ~ st.name ~ ' (id=' ~ (_create_resp.json.Id | default("desconocido") | string) ~ ')'
-                )
-            )
+            'Stack ' ~ st.name ~ ' presente (id=' ~ (_final_stack_id | string) ~ ')',
+            'No se pudo confirmar la creación/actualización del stack ' ~ st.name
           )
       }}
