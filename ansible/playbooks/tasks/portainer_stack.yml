@@ -30,7 +30,7 @@
 - name: Preparar GIT_SSH_COMMAND si hay deploy key en ruta
   ansible.builtin.set_fact:
     _git_ssh_command: >-
-      {{ 'ssh -o StrictHostKeyChecking=accept-new -i ' ~ github_deploy_key_path
+      {{ 'ssh -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -i ' ~ github_deploy_key_path
          if (github_deploy_key_path is defined and github_deploy_key_path|length>0)
          else omit }}
   when: github_deploy_key_path is defined and github_deploy_key_path|length > 0
@@ -48,7 +48,7 @@
 
 - name: Preparar GIT_SSH_COMMAND (si deploy key fue escrita)
   ansible.builtin.set_fact:
-    _git_ssh_command: "ssh -o StrictHostKeyChecking=accept-new -i {{ _git_base }}/id_rsa"
+    _git_ssh_command: "ssh -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -i {{ _git_base }}/id_rsa"
   when: github_deploy_key is defined and github_deploy_key|length > 0
   delegate_to: localhost
   run_once: true
@@ -61,7 +61,17 @@
     accept_hostkey: true
     update: true
   environment: >-
-    {{ ({ 'GIT_SSH_COMMAND': _git_ssh_command } if _git_ssh_command is defined else {}) }}
+    {{
+      (
+        { 'GIT_SSH_COMMAND': _git_ssh_command }
+        if _git_ssh_command is defined
+        else {
+          'GIT_SSH_COMMAND':
+            'ssh -i ' ~ (lookup("env","HOME") ~ '/.ssh/id_ed25519') ~
+            ' -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new'
+        }
+      )
+    }}
   delegate_to: localhost
 
 # ====== Leer compose y .env, y normalizar Env ======
