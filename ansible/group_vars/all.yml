@@ -85,5 +85,7 @@ git_ssh_key_path: /home/ansible/.ssh/id_ed25519
 repo_url: https://github.com/infra-trade/infra.git
 
 portainer_base_url: "https://10.20.0.12:9443"
+portainer_url: "https://10.20.0.12:9443"
 portainer_use_api_key: true
 portainer_api_token: "ptr_HfUaHqlQUk2K/DZPmB0WxHsvtkESiHSEwvCO0vFcEqE="
+portainer_api_key: "ptr_HfUaHqlQUk2K/DZPmB0WxHsvtkESiHSEwvCO0vFcEqE="
