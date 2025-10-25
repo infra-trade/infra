@@ -1,42 +1,52 @@
 ---
 # playbooks/tasks/resolve_portainer_endpoint_and_deploy.yml
-# Ejecutado vía: include_tasks con loop de items (mon, airflow, kafka, spark, db)
-# Requiere (del play principal):
-# - portainer_url_effective
-# - portainer_api_token
-# - portainer_use_api_key (bool, por defecto true)
-# - endpoints_list (de /api/endpoints)
-# - stacks_effective (definido en group_vars o -e)
-#
-# Opcional:
-# - alias_map (mapa alias->nombre real de endpoint en Portainer). Si no viene, generamos uno por defecto.
 
 ############################################################
-# 0) Resolver el objeto de stack para este item
+# 0) Resolver el objeto de stack para este item (robusto)
 ############################################################
+- name: Normalizar colecciones de stacks (mapa y lista)
+  set_fact:
+    _stacks_map: "{{ (stacks_effective | default({})) if (stacks_effective is mapping) else {} }}"
+    _stacks_seq: "{{ (stacks_effective | default([]))  if (stacks_effective is sequence) else [] }}"
+
+- name: Resolver coincidencia por nombre en la lista (si aplica)
+  set_fact:
+    _seq_match: >-
+      {{
+        (_stacks_seq
+          | selectattr('name','defined')
+          | selectattr('name','equalto', item)
+          | list)
+        if (_stacks_seq | length) > 0 else []
+      }}
+
 - name: Resolve current stack object to _it
   set_fact:
     _it: >-
       {{
-        (
-          stacks_effective[item]
-            if (stacks_effective is mapping and (item in stacks_effective))
-          else
+        _stacks_map[item]
+          if (_stacks_map is mapping and (item in _stacks_map))
+        else
           (
-            (stacks_effective | selectattr('name','equalto', item) | list | first)
-              if (stacks_effective is sequence)
+            _seq_match[0]
+              if (_seq_match | length) > 0
             else
               (item if (item is mapping) else {})
           )
-        )
       }}
 
 - name: Ensure _it is a valid stack object
   assert:
     that:
       - _it is mapping
+      - (_it.name | default('')) | length > 0
     success_msg: "All assertions passed"
-    fail_msg: "_it no es un objeto de stack válido (mapping). Revisa stacks_effective y el item actual."
+    fail_msg: >
+      No encontré definición para el item '{{ item }}' en 'stacks_effective'.
+      Define un objeto con 'name' en stacks_effective (mapa o lista).
+      Pistas:
+      - keys del mapa: {{ _stacks_map.keys() | default([]) }}
+      - nombres en la lista: {{ (_stacks_seq | map(attribute='name') | list) | default([]) }}
 
 ############################################################
 # 1) Headers de autenticación (API Key o JWT)
@@ -77,7 +87,7 @@
       - _compose_path | length > 0
       - _git_ref | length > 0
     success_msg: "All assertions passed"
-    fail_msg: "Faltan campos requeridos en el stack (_name, _repo_url, _compose_path, _git_ref)."
+    fail_msg: "Faltan campos requeridos (_name, _repo_url, _compose_path, _git_ref)."
 
 ############################################################
 # 3) Resolver endpointId (con alias si hace falta)
@@ -89,7 +99,7 @@
         endpoints_by_name_map
           if (endpoints_by_name_map is defined)
         else
-          (dict(endpoints_list | map('extract', attribute='Name') | zip(endpoints_list | map(attribute='Id'))))
+          (dict(endpoints_list | map(attribute='Name') | zip(endpoints_list | map(attribute='Id'))))
       }}
 
 - name: Build default alias map and merge with provided alias_map
@@ -147,20 +157,23 @@
           (_stacks_list.json | default([]))
           | selectattr('Name','equalto', _name)
           | list
-          | first
-        ).Id
-        if ((_stacks_list.json | default([])) | selectattr('Name','equalto', _name) | list | length) > 0
-        else ''
+        ) | length > 0
+          | ternary(
+              ((_stacks_list.json | default([]))
+               | selectattr('Name','equalto', _name)
+               | list)[0].Id,
+              ''
+            )
       }}
 
 ############################################################
-# 5) Definir URLs de creación (NEW/LEGACY/HÍBRIDO)
+# 5) Definir URLs de creación (hybrid + legacy)
 ############################################################
 - name: Define create URLs (hybrid + legacy)
   set_fact:
-    _create_url_repo_new:    "{{ portainer_url_effective }}/api/stacks/create?type=2&method=repository&endpointId={{ _endpoint_id }}"
-    _create_url_string_new:  "{{ portainer_url_effective }}/api/stacks/create?type=2&method=string&endpointId={{ _endpoint_id }}"
-    _create_url_repo_legacy: "{{ portainer_url_effective }}/api/stacks?type=2&method=repository&endpointId={{ _endpoint_id }}"
+    _create_url_repo_new:      "{{ portainer_url_effective }}/api/stacks/create?type=2&method=repository&endpointId={{ _endpoint_id }}"
+    _create_url_string_new:    "{{ portainer_url_effective }}/api/stacks/create?type=2&method=string&endpointId={{ _endpoint_id }}"
+    _create_url_repo_legacy:   "{{ portainer_url_effective }}/api/stacks?type=2&method=repository&endpointId={{ _endpoint_id }}"
     _create_url_string_legacy: "{{ portainer_url_effective }}/api/stacks?type=2&method=string&endpointId={{ _endpoint_id }}"
 
 - name: Debug create URLs to auditar
@@ -172,7 +185,7 @@
       string_new: "{{ _create_url_string_new }}"
 
 ############################################################
-# 6) Intento de creación desde REPO (primero NEW, LEGACY solo si NEW==404)
+# 6) Intento de creación desde REPO (NEW; LEGACY solo si NEW==404)
 ############################################################
 - name: Try create stack {{ _name }} from repository (NEW path)
   uri:
@@ -298,6 +311,5 @@
   when: _need_string_fallback
 
 ############################################################
-# 9) (Opcional) Aquí podrías añadir lógica de update/redeploy
-#    si _existing_stack_id está definido.
+# 9) (Opcional) Lógica de update/redeploy si _existing_stack_id existe
 ############################################################
