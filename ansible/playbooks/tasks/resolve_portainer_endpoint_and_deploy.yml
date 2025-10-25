@@ -1,137 +1,179 @@
 ---
-# Este task-file se incluye con "loop: stacks_effective" (variable 'item' disponible)
+# playbooks/tasks/resolve_portainer_endpoint_and_deploy.yml
+# Ejecutado vía: include_tasks con loop de items (mon, airflow, kafka, spark, db)
+# Requiere (del play principal):
+# - portainer_url_effective
+# - portainer_api_token
+# - portainer_use_api_key (bool, por defecto true)
+# - endpoints_list (de /api/endpoints)
+# - stacks_effective (definido en group_vars o -e)
+#
+# Opcional:
+# - alias_map (mapa alias->nombre real de endpoint en Portainer). Si no viene, generamos uno por defecto.
 
+############################################################
+# 0) Resolver el objeto de stack para este item
+############################################################
 - name: Resolve current stack object to _it
   set_fact:
-    _it: "{{ item }}"
+    _it: >-
+      {{
+        (
+          stacks_effective[item]
+            if (stacks_effective is mapping and (item in stacks_effective))
+          else
+          (
+            (stacks_effective | selectattr('name','equalto', item) | list | first)
+              if (stacks_effective is sequence)
+            else
+              (item if (item is mapping) else {})
+          )
+        )
+      }}
 
 - name: Ensure _it is a valid stack object
   assert:
     that:
       - _it is mapping
-    fail_msg: "El elemento del loop no es un dict de stack: {{ _it | to_nice_yaml }}"
+    success_msg: "All assertions passed"
+    fail_msg: "_it no es un objeto de stack válido (mapping). Revisa stacks_effective y el item actual."
 
-# =========================
-# AUTENTICACIÓN / HEADERS
-# =========================
+############################################################
+# 1) Headers de autenticación (API Key o JWT)
+############################################################
 - name: Build Portainer auth headers
   set_fact:
     _portainer_auth_headers: >-
       {{
-        ({'X-API-Key': portainer_api_token})
-        if (portainer_use_api_key_effective | default(false) | bool)
-        else ({'Authorization': 'Bearer ' ~ portainer_api_token})
+        {'X-API-Key': portainer_api_token}
+        if (portainer_use_api_key | default(true)) | bool
+        else {'Authorization': 'Bearer ' ~ portainer_api_token}
       }}
 
 - name: Validate token presence
   assert:
     that:
-      - portainer_api_token | string | length > 0
-    fail_msg: "portainer_api_token vacío (se requiere API Key o JWT)"
+      - (portainer_api_token | string | length) > 0
+    success_msg: "All assertions passed"
+    fail_msg: "portainer_api_token vacío. Define la API Key o el JWT."
 
-# =========================
-# NORMALIZACIÓN / VALIDACIÓN
-# =========================
+############################################################
+# 2) Normalizar/validar campos del stack
+############################################################
 - name: Normalize fields
   set_fact:
-    _name: "{{ _it.name }}"
-    _endpoint: "{{ _it.endpoint | default('') }}"
-    _endpoint_id: "{{ _it.endpoint_id | default('') }}"
-    _repo_url: "{{ _it.repo_url }}"
-    _compose_path: "{{ _it.compose_path }}"
-    _git_ref: "{{ _it.git_ref | default('main') }}"
-    _env: "{{ _it.env | default([]) }}"
-    _method: "{{ _it.method | default('repository') }}"   # repository|string
+    _name: "{{ _it.name | default(_it.Name) | default('') }}"
+    _endpoint: "{{ _it.endpoint | default(_it.Endpoint) | default('') }}"
+    _repo_url: "{{ _it.repo_url | default(_it.RepositoryURL) | default('') }}"
+    _compose_path: "{{ _it.compose_path | default(_it.StackFilePath) | default('') }}"
+    _git_ref: "{{ _it.git_ref | default(_it.RepositoryReferenceName) | default('main') }}"
+    _env: "{{ _it.env | default(_it.Env) | default([]) }}"
 
 - name: Validate required fields
   assert:
     that:
-      - _name | string | length > 0
-      - (_endpoint | string | length > 0) or (_endpoint_id | string | length > 0)
-      - _repo_url | string | length > 0
-      - _compose_path | string | length > 0
-    fail_msg: "Campos requeridos faltantes en stack {{ _it | to_nice_yaml }}"
+      - _name | length > 0
+      - _repo_url | length > 0
+      - _compose_path | length > 0
+      - _git_ref | length > 0
+    success_msg: "All assertions passed"
+    fail_msg: "Faltan campos requeridos en el stack (_name, _repo_url, _compose_path, _git_ref)."
 
-# =========================
-# RESOLVER endpointId
-# =========================
+############################################################
+# 3) Resolver endpointId (con alias si hace falta)
+############################################################
+- name: Build endpoints_by_name_map if missing
+  set_fact:
+    endpoints_by_name_map: >-
+      {{
+        endpoints_by_name_map
+          if (endpoints_by_name_map is defined)
+        else
+          (dict(endpoints_list | map('extract', attribute='Name') | zip(endpoints_list | map(attribute='Id'))))
+      }}
+
+- name: Build default alias map and merge with provided alias_map
+  set_fact:
+    _alias_map: >-
+      {{
+        {'airflow':'airflow-core',
+         'kafka':'kafka-core',
+         'spark':'spark-core',
+         'db':'db-core',
+         'mon':'local'}
+        | combine(alias_map | default({}))
+      }}
+
 - name: Resolve endpointId
   set_fact:
-    _endpoint_resolved_id: >-
-      {%- if (_endpoint_id | string | length) > 0 -%}
-        {{ _endpoint_id }}
-      {%- elif (_endpoint | string | length) > 0 -%}
-        {%- set e = _endpoint -%}
-        {%- set alias = (alias_map | default({})).get(e, e) -%}
-        {{ (endpoints_by_name_map | default({})).get(alias) | default((endpoints_by_name_map | default({})).get(e, '')) }}
+    _endpoint_id: >-
+      {%- set e = (_endpoint | string) -%}
+      {%- if e | length == 0 -%}
+        {{ endpoints_by_name_map.get('local') | default('') }}
       {%- else -%}
-        {{ (endpoints_by_name_map | default({})).get('local','') }}
+        {%- set alias = _alias_map.get(e, e) -%}
+        {{ endpoints_by_name_map.get(alias) | default(endpoints_by_name_map.get(e)) | default('') }}
       {%- endif -%}
 
 - name: Fail if endpoint cannot be resolved
   assert:
     that:
-      - _endpoint_resolved_id | string | length > 0
-    fail_msg: "No pude resolver endpointId para endpoint '{{ _endpoint }}' (alias='{{ (alias_map|default({})).get(_endpoint,_endpoint) }}'). Mapa: {{ endpoints_by_name_map }}"
+      - (_endpoint_id | string | length) > 0
+    success_msg: "All assertions passed"
+    fail_msg: "No se pudo resolver endpointId para endpoint='{{ _endpoint }}'. Revisa endpoints_list/alias_map."
 
-# =========================
-# LISTAR STACKS
-# =========================
+############################################################
+# 4) Leer stacks existentes
+############################################################
 - name: Fetch stacks list
   uri:
-    url: "{{ portainer_base_url }}/api/stacks"
+    url: "{{ portainer_url_effective }}/api/stacks"
     method: GET
     validate_certs: false
     headers: "{{ _portainer_auth_headers }}"
-    return_content: yes
-    status_code: 200
+    status_code: [200, 401]
   register: _stacks_list
 
 - name: Fail if unauthorized (bad/expired token or wrong header type)
   fail:
-    msg: "Portainer devolvió 401 Unauthorized. Verifica: - Si usas API Key, define portainer_use_api_key: true - Si usas JWT, que no esté expirado (re-genera). Detalle: {{ _stacks_list.json | default(_stacks_list.content) }}"
-  when: _stacks_list.status | default(200) == 401
+    msg: "Portainer devolvió 401 Unauthorized. Verifica tu token o header. Detalle: {{ _stacks_list.json | default({}) }}"
+  when: _stacks_list.status == 401
 
-# =========================
-# BUSCAR STACK EXISTENTE
-# =========================
 - name: Find existing stack id by name (exact match)
   set_fact:
     _existing_stack_id: >-
       {{
-        (_stacks_list.json | default([]))
-          | selectattr('Name', 'equalto', _name)
-          | map(attribute='Id')
-          | first | default('')
+        (
+          (_stacks_list.json | default([]))
+          | selectattr('Name','equalto', _name)
+          | list
+          | first
+        ).Id
+        if ((_stacks_list.json | default([])) | selectattr('Name','equalto', _name) | list | length) > 0
+        else ''
       }}
 
-# =========================
-# CREAR / ACTUALIZAR
-# =========================
-# RUTAS:
-#   NUEVA:   POST /api/stacks/create?type=2&method=repository|string&endpointId=...
-#   LEGADA:  POST /api/stacks?type=2&method=repository|string&endpointId=...
+############################################################
+# 5) Definir URLs de creación (NEW/LEGACY/HÍBRIDO)
+############################################################
 - name: Define create URLs (hybrid + legacy)
   set_fact:
-    _create_url_repo_new: >-
-      {{ portainer_base_url }}/api/stacks/create?type=2&method=repository&endpointId={{ _endpoint_resolved_id }}
-    _create_url_string_new: >-
-      {{ portainer_base_url }}/api/stacks/create?type=2&method=string&endpointId={{ _endpoint_resolved_id }}
-    _create_url_repo_legacy: >-
-      {{ portainer_base_url }}/api/stacks?type=2&method=repository&endpointId={{ _endpoint_resolved_id }}
-    _create_url_string_legacy: >-
-      {{ portainer_base_url }}/api/stacks?type=2&method=string&endpointId={{ _endpoint_resolved_id }}
+    _create_url_repo_new:    "{{ portainer_url_effective }}/api/stacks/create?type=2&method=repository&endpointId={{ _endpoint_id }}"
+    _create_url_string_new:  "{{ portainer_url_effective }}/api/stacks/create?type=2&method=string&endpointId={{ _endpoint_id }}"
+    _create_url_repo_legacy: "{{ portainer_url_effective }}/api/stacks?type=2&method=repository&endpointId={{ _endpoint_id }}"
+    _create_url_string_legacy: "{{ portainer_url_effective }}/api/stacks?type=2&method=string&endpointId={{ _endpoint_id }}"
 
 - name: Debug create URLs to auditar
   debug:
     msg:
-      repo_new: "{{ _create_url_repo_new }}"
-      string_new: "{{ _create_url_string_new }}"
       repo_legacy: "{{ _create_url_repo_legacy }}"
+      repo_new: "{{ _create_url_repo_new }}"
       string_legacy: "{{ _create_url_string_legacy }}"
-  when: _existing_stack_id | string | length == 0
+      string_new: "{{ _create_url_string_new }}"
 
-# --------- CREAR DESDE REPO (INTENTO NUEVO -> LEGADO) ----------
+############################################################
+# 6) Intento de creación desde REPO (primero NEW, LEGACY solo si NEW==404)
+############################################################
 - name: Try create stack {{ _name }} from repository (NEW path)
   uri:
     url: "{{ _create_url_repo_new }}"
@@ -150,7 +192,7 @@
   register: _create_repo_new
   when: _existing_stack_id | string | length == 0
 
-- name: Try create stack {{ _name }} from repository (LEGACY path if needed)
+- name: Try create stack {{ _name }} from repository (LEGACY path if NEW returned 404)
   uri:
     url: "{{ _create_url_repo_legacy }}"
     method: POST
@@ -164,33 +206,36 @@
       RepositoryReferenceName: "{{ _git_ref }}"
       ComposeFormat: 2
       Env: "{{ _env }}"
-    status_code: [200, 201, 409]
+    status_code: [200, 201, 409, 405]
   register: _create_repo_legacy
+  failed_when: false
   when:
     - _existing_stack_id | string | length == 0
-    - (_create_repo_new.status | default(0)) in [405, 404]
+    - (_create_repo_new.status | default(0)) == 404
 
-# --------- FALLBACK STRING (INTENTO NUEVO -> LEGADO) ----------
+############################################################
+# 7) ¿Necesitamos fallback a STRING?
+############################################################
 - name: Need fallback to string?
   set_fact:
     _need_string_fallback: >-
       {{
         _existing_stack_id | string | length == 0 and
         (
-          (_create_repo_new.status | default(0)) in [405, 404] and
-          (_create_repo_legacy.status | default(0)) in [405, 404]
-          or
-          (_create_repo_new is not defined and _create_repo_legacy is not defined)
+          (_create_repo_new.status | default(0)) in [405, 404]
+          or (_create_repo_new is not defined)
         )
       }}
 
+############################################################
+# 8) Fallback a STRING (NEW; LEGACY solo si NEW==404)
+############################################################
 - name: Create unique temp dir for {{ _name }} (fallback)
   tempfile:
     state: directory
-    suffix: "_ans_port_{{ _name }}"
+    prefix: ans_port_{{ _name }}_
   register: _tmpdir
   delegate_to: localhost
-  become: false
   when: _need_string_fallback
 
 - name: Clone repo for {{ _name }} (fallback create via string, idempotent)
@@ -199,9 +244,8 @@
     dest: "{{ _tmpdir.path }}"
     version: "{{ _git_ref }}"
     accept_hostkey: true
-    update: yes
+    force: true
   delegate_to: localhost
-  become: false
   when: _need_string_fallback
 
 - name: Read compose file content (fallback)
@@ -209,7 +253,6 @@
     src: "{{ _tmpdir.path }}/{{ _compose_path }}"
   register: _compose_slurp
   delegate_to: localhost
-  become: false
   when: _need_string_fallback
 
 - name: Create stack {{ _name }} via method=string (NEW path)
@@ -228,7 +271,7 @@
   register: _create_string_new
   when: _need_string_fallback
 
-- name: Create stack {{ _name }} via method=string (LEGACY path if needed)
+- name: Create stack {{ _name }} via method=string (LEGACY path if NEW returned 404)
   uri:
     url: "{{ _create_url_string_legacy }}"
     method: POST
@@ -240,100 +283,21 @@
       StackFileContent: "{{ (_compose_slurp.content | b64decode) }}"
       ComposeFormat: 2
       Env: "{{ _env }}"
-    status_code: [200, 201, 409]
+    status_code: [200, 201, 409, 405]
   register: _create_string_legacy
+  failed_when: false
   when:
     - _need_string_fallback
-    - (_create_string_new.status | default(0)) in [405, 404]
+    - (_create_string_new.status | default(0)) == 404
 
-- name: Cleanup temp dir (fallback)
+- name: Cleanup temp dir
   file:
     path: "{{ _tmpdir.path }}"
     state: absent
   delegate_to: localhost
-  become: false
-  when:
-    - _need_string_fallback
-    - _tmpdir is defined
-    - _tmpdir.path is defined
+  when: _need_string_fallback
 
-# --------- UPDATE EXISTENTE ----------
-- name: Update git ref / file path on existing stack {{ _name }} (best effort)
-  uri:
-    url: "{{ portainer_base_url }}/api/stacks/{{ _existing_stack_id }}"
-    method: PUT
-    validate_certs: false
-    headers: "{{ _portainer_auth_headers }}"
-    body_format: json
-    body:
-      RepositoryReferenceName: "{{ _git_ref }}"
-      StackFilePath: "{{ _compose_path }}"
-    status_code: [200, 204, 400, 404]
-  register: _update_existing
-  when: _existing_stack_id | string | length > 0
-
-- name: Git redeploy existing stack {{ _name }}
-  uri:
-    url: "{{ portainer_base_url }}/api/stacks/{{ _existing_stack_id }}/git/redeploy?endpointId={{ _endpoint_resolved_id }}"
-    method: POST
-    validate_certs: false
-    headers: "{{ _portainer_auth_headers }}"
-    status_code: [200, 204, 400, 404, 405]
-  register: _git_redeploy
-  when: _existing_stack_id | string | length > 0
-
-- name: Decide if we must recreate stack from repository
-  set_fact:
-    _must_recreate_from_repo: "{{ (_git_redeploy.status | default(0)) == 405 }}"
-  when: _existing_stack_id | string | length > 0
-
-- name: Delete non-git stack {{ _name }} to recreate from repository
-  uri:
-    url: "{{ portainer_base_url }}/api/stacks/{{ _existing_stack_id }}?endpointId={{ _endpoint_resolved_id }}"
-    method: DELETE
-    validate_certs: false
-    headers: "{{ _portainer_auth_headers }}"
-    status_code: [200, 204, 404]
-  register: _delete_existing
-  when:
-    - _existing_stack_id | string | length > 0
-    - _must_recreate_from_repo
-
-- name: Re-create stack {{ _name }} from repository (attempt NEW then LEGACY)
-  block:
-    - name: Re-create (NEW)
-      uri:
-        url: "{{ _create_url_repo_new }}"
-        method: POST
-        validate_certs: false
-        headers: "{{ _portainer_auth_headers }}"
-        body_format: json
-        body:
-          Name: "{{ _name }}"
-          StackFilePath: "{{ _compose_path }}"
-          RepositoryURL: "{{ _repo_url }}"
-          RepositoryReferenceName: "{{ _git_ref }}"
-          ComposeFormat: 2
-          Env: "{{ _env }}"
-        status_code: [200, 201, 409, 405, 404]
-      register: _recreate_repo_new
-
-    - name: Re-create (LEGACY if needed)
-      uri:
-        url: "{{ _create_url_repo_legacy }}"
-        method: POST
-        validate_certs: false
-        headers: "{{ _portainer_auth_headers }}"
-        body_format: json
-        body:
-          Name: "{{ _name }}"
-          StackFilePath: "{{ _compose_path }}"
-          RepositoryURL: "{{ _repo_url }}"
-          RepositoryReferenceName: "{{ _git_ref }}"
-          ComposeFormat: 2
-          Env: "{{ _env }}"
-        status_code: [200, 201, 409]
-      when: (_recreate_repo_new.status | default(0)) in [405, 404]
-  when:
-    - _existing_stack_id | string | length > 0
-    - _must_recreate_from_repo
+############################################################
+# 9) (Opcional) Aquí podrías añadir lógica de update/redeploy
+#    si _existing_stack_id está definido.
+############################################################
