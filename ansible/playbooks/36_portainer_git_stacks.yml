@@ -1,85 +1,389 @@
 ---
 - name: Create/Update Portainer stacks from Git (dynamic endpointId)
-  hosts: mon-core
+  hosts: all
+  become: true
   gather_facts: false
 
   vars:
-    portainer_validate_certs: false
+    # ==== AJUSTA AQUÍ SEGÚN TU ENTORNO ====
+    # URL base de Portainer (https o http)
+    portainer_base_url: "https://10.20.0.12:9443"
+    # Token: puede ser API Key o JWT (según portainer_use_api_key)
+    # SUGERIDO: usa API Key y deja portainer_use_api_key: true
+    portainer_api_token: "{{ lookup('env', 'PORTAINER_TOKEN') | default('', true) }}"
+    portainer_use_api_key: true
 
-    endpoint_aliases_default:
-      mon: local
-      airflow: airflow-core
-      kafka: kafka-core
-      spark: spark-core
-      db: db-core
+    # Mapeo simple de aliases -> nombre real de endpoint en Portainer
+    # Ajusta a tus nombres reales de endpoints (según lo que lista /api/endpoints)
+    portainer_endpoint_aliases:
+      mon: "local"
+      airflow: "airflow-core"
+      kafka: "kafka-core"
+      spark: "spark-core"
+      db: "db-core"
 
-    # Prioriza PORTAINER_TOKEN del entorno
-    portainer_api_token: "{{ lookup('env','PORTAINER_TOKEN') | default(portainer_token | default(''), true) }}"
+    # Lista de stacks a gestionar (puedes sobreescribirla desde group_vars/-e)
+    stacks:
+      - name: mon
+        endpoint: mon
+        repo_url: "git@github.com:infra-trade/infra.git"
+        compose_path: "mon/compose/docker-compose.yml"
+        git_ref: "main"
+        env: []
+      - name: airflow
+        endpoint: airflow
+        repo_url: "git@github.com:infra-trade/infra.git"
+        compose_path: "airflow/compose/docker-compose.yml"
+        git_ref: "main"
+        env: []
+      - name: kafka
+        endpoint: kafka
+        repo_url: "git@github.com:infra-trade/infra.git"
+        compose_path: "kafka/compose/docker-compose.yml"
+        git_ref: "main"
+        env: []
+      - name: spark
+        endpoint: spark
+        repo_url: "git@github.com:infra-trade/infra.git"
+        compose_path: "spark/compose/docker-compose.yml"
+        git_ref: "main"
+        env: []
+      - name: db
+        endpoint: db
+        repo_url: "git@github.com:infra-trade/infra.git"
+        compose_path: "db/compose/docker-compose.yml"
+        git_ref: "main"
+        env: []
 
-  pre_tasks:
+  tasks:
     - name: Build effective Portainer URL (avoid self-recursion)
-      ansible.builtin.set_fact:
-        portainer_url_effective: >-
-          {{ (portainer_url is defined and (portainer_url|string)|length > 0)
-             | ternary(portainer_url,
-                       'https://' ~ (hostvars[inventory_hostname].ansible_host | default(inventory_hostname)) ~ ':9443') }}
+    # evita que alguien pase ya /api/ dentro de la var
+      set_fact:
+        portainer_base_url: "{{ portainer_base_url | regex_replace('/+$', '') }}"
 
     - name: Fail early if token missing
-      ansible.builtin.assert:
-        that: portainer_api_token | length > 0
-        fail_msg: "Falta API key. Exporta PORTAINER_TOKEN o define portainer_token en group_vars."
+      assert:
+        that:
+          - portainer_api_token | string | length > 0
+        fail_msg: "portainer_api_token vacío. Define un API Key o JWT; recomendado API Key y portainer_use_api_key: true"
 
     - name: Check Portainer is reachable
-      ansible.builtin.uri:
-        url: "{{ portainer_url_effective }}/api/system/status"
+      uri:
+        url: "{{ portainer_base_url }}/api/system/status"
         method: GET
-        headers:
-          X-API-Key: "{{ portainer_api_token }}"
-        validate_certs: "{{ portainer_validate_certs }}"
+        validate_certs: false
+        return_content: false
         status_code: 200
+      register: _portainer_ping
 
     - name: Fetch endpoints
-      ansible.builtin.uri:
-        url: "{{ portainer_url_effective }}/api/endpoints?limit=1000"
+      uri:
+        url: "{{ portainer_base_url }}/api/endpoints"
         method: GET
-        headers:
-          X-API-Key: "{{ portainer_api_token }}"
-        validate_certs: "{{ portainer_validate_certs }}"
+        validate_certs: false
+        headers: >-
+          {{
+            ({'X-API-Key': portainer_api_token})
+            if (portainer_use_api_key | default(false) | bool)
+            else ({'Authorization': 'Bearer ' ~ portainer_api_token})
+          }}
         status_code: 200
-        return_content: true
       register: _endpoints
 
     - name: Build endpoints maps/lists (use internal var names to avoid collisions)
-      ansible.builtin.set_fact:
-        __endpoints_by_name: "{{ dict( (_endpoints.json | map(attribute='Name') | list)
-                              | zip(_endpoints.json | map(attribute='Id') | list) ) }}"
-        endpoints_list: "{{ _endpoints.json | json_query('[].{Id: Id, Name: Name, URL: URL, PublicURL: PublicURL, Type: Type}') }}"
-        __alias_map: "{{ endpoint_aliases_default | combine(endpoint_aliases | default({}), recursive=True) }}"
+      set_fact:
+        _endpoints_list: "{{ _endpoints.json | default([]) }}"
+        _endpoints_by_name_map: >-
+          {{
+            dict((_endpoints.json | default([])) | map('extract', {'Name':'Name','Id':'Id'})
+                 | map('community.general.dict_kv', 'Name', 'Id')
+                 | map(attribute='dict') | list)
+          }}
+      vars:
+        # helper filter: transforma [{Name:x,Id:y}] -> [{'dict': {'x': y}}, ...]
+        # usamos community.general.dict_kv que está disponible en collections comunes;
+        # si no la tienes, reemplaza por un pequeño loop más abajo.
+        dummy: ""
 
     - name: Load stacks (from group_vars or -e) into stacks_effective
-      ansible.builtin.set_fact:
-        stacks_effective: "{{ (stacks if (stacks is defined) else []) }}"
+      set_fact:
+        stacks_effective: "{{ stacks | default([]) }}"
 
     - name: Assert stacks are provided
-      ansible.builtin.assert:
+      assert:
         that:
           - stacks_effective | length > 0
-        fail_msg: "No se encontró 'stacks'. Define en group_vars/mon-core.yml o pásalas por -e."
+        fail_msg: "No se recibieron stacks (var 'stacks' vacía)."
 
     - name: Show detected endpoints (audit)
-      ansible.builtin.debug:
-        var: endpoints_list
+      debug:
+        var: _endpoints_list
 
-  tasks:
     - name: Resolve endpoint and deploy (per stack)
-      ansible.builtin.include_tasks: "tasks/resolve_portainer_endpoint_and_deploy.yml"
+      include_tasks: "tasks/resolve_portainer_endpoint_and_deploy.yml"
       loop: "{{ stacks_effective }}"
       loop_control:
-        loop_var: st
+        loop_var: item
+        label: "{{ item.name }}"
       vars:
-        # usar nombres distintos para evitar auto-referencias
-        p_url: "{{ portainer_url_effective }}"
-        p_api_token: "{{ portainer_api_token }}"
-        p_validate_certs: "{{ portainer_validate_certs }}"
-        endpoints_by_name_map: "{{ __endpoints_by_name }}"
-        alias_map: "{{ __alias_map }}"
+        endpoints_by_name_map: "{{ _endpoints_by_name_map }}"
+        alias_map: "{{ portainer_endpoint_aliases }}"
+        portainer_use_api_key_effective: "{{ portainer_use_api_key | default(false) | bool }}"
+playbooks/tasks/resolve_portainer_endpoint_and_deploy.yml
+yaml
+Copiar código
+---
+# Este task-file se incluye con "loop: stacks_effective" (variable 'item' disponible)
+
+- name: Resolve current stack object to _it
+  set_fact:
+    _it: "{{ item }}"
+
+- name: Ensure _it is a valid stack object
+  assert:
+    that:
+      - _it is mapping
+    fail_msg: "El elemento del loop no es un dict de stack: {{ _it | to_nice_yaml }}"
+
+# =========================
+# AUTENTICACIÓN / HEADERS
+# =========================
+- name: Build Portainer auth headers
+  set_fact:
+    _portainer_auth_headers: >-
+      {{
+        ({'X-API-Key': portainer_api_token})
+        if (portainer_use_api_key_effective | default(false) | bool)
+        else ({'Authorization': 'Bearer ' ~ portainer_api_token})
+      }}
+
+# (Opcional) Debug para verificar qué cabeceras se enviarán
+# - name: DEBUG - Ver headers que se enviarán
+#   debug:
+#     var: _portainer_auth_headers
+
+- name: Validate token presence
+  assert:
+    that:
+      - portainer_api_token | string | length > 0
+    fail_msg: "portainer_api_token vacío (se requiere API Key o JWT)"
+
+# =========================
+# NORMALIZACIÓN / VALIDACIÓN
+# =========================
+- name: Normalize fields
+  set_fact:
+    _name: "{{ _it.name }}"
+    _endpoint: "{{ _it.endpoint | default('') }}"
+    _endpoint_id: "{{ _it.endpoint_id | default('') }}"
+    _repo_url: "{{ _it.repo_url }}"
+    _compose_path: "{{ _it.compose_path }}"
+    _git_ref: "{{ _it.git_ref | default('main') }}"
+    _env: "{{ _it.env | default([]) }}"
+    _method: "{{ _it.method | default('repository') }}"   # repository|string
+
+- name: Validate required fields
+  assert:
+    that:
+      - _name | string | length > 0
+      - (_endpoint | string | length > 0) or (_endpoint_id | string | length > 0)
+      - _repo_url | string | length > 0
+      - _compose_path | string | length > 0
+    fail_msg: "Campos requeridos faltantes en stack {{ _it | to_nice_yaml }}"
+
+# =========================
+# RESOLVER endpointId
+# =========================
+- name: Resolve endpointId
+  set_fact:
+    _endpoint_resolved_id: >-
+      {%- if (_endpoint_id | string | length) > 0 -%}
+        {{ _endpoint_id }}
+      {%- elif (_endpoint | string | length) > 0 -%}
+        {%- set e = _endpoint -%}
+        {%- set alias = (alias_map | default({})).get(e, e) -%}
+        {{ (endpoints_by_name_map | default({})).get(alias) | default((endpoints_by_name_map | default({})).get(e, '')) }}
+      {%- else -%}
+        {{ (endpoints_by_name_map | default({})).get('local','') }}
+      {%- endif -%}
+
+- name: Fail if endpoint cannot be resolved
+  assert:
+    that:
+      - _endpoint_resolved_id | string | length > 0
+    fail_msg: "No pude resolver endpointId para endpoint '{{ _endpoint }}' (alias='{{ (alias_map|default({})).get(_endpoint,_endpoint) }}'). Mapa: {{ endpoints_by_name_map }}"
+
+# =========================
+# LISTAR STACKS (usa API Key si está activada)
+# =========================
+- name: Fetch stacks list
+  uri:
+    url: "{{ portainer_base_url }}/api/stacks"
+    method: GET
+    validate_certs: false
+    headers: "{{ _portainer_auth_headers }}"
+    return_content: yes
+    status_code: 200
+  register: _stacks_list
+
+# Defensa explícita ante 401: si esto fallara, capturaría Unauthorized con mensaje guía
+- name: Fail if unauthorized (bad/expired token or wrong header type)
+  fail:
+    msg: "Portainer devolvió 401 Unauthorized. Verifica: - Si usas API Key, define portainer_use_api_key: true - Si usas JWT, que no esté expirado (re-genera). Detalle: {{ _stacks_list.json | default(_stacks_list.content) }}"
+  when: _stacks_list.status | default(200) == 401
+
+# =========================
+# BUSCAR STACK EXISTENTE
+# =========================
+- name: Find existing stack id by name (exact match)
+  set_fact:
+    _existing_stack_id: >-
+      {{
+        (_stacks_list.json | default([]))
+          | selectattr('Name', 'equalto', _name)
+          | map(attribute='Id')
+          | first | default('')
+      }}
+
+# =========================
+# CREAR / ACTUALIZAR
+# =========================
+
+# Intento de CREATE vía method=repository (Git), que es el camino ideal
+- name: Try create stack {{ _name }} from repository
+  uri:
+    url: "{{ portainer_base_url }}/api/stacks?type=2&method=repository&endpointId={{ _endpoint_resolved_id }}"
+    method: POST
+    validate_certs: false
+    headers: "{{ _portainer_auth_headers }}"
+    body_format: json
+    body:
+      Name: "{{ _name }}"
+      StackFilePath: "{{ _compose_path }}"
+      RepositoryURL: "{{ _repo_url }}"
+      RepositoryReferenceName: "{{ _git_ref }}"
+      ComposeFormat: 2
+      # Env (si fuera necesario pasarlas)
+      Env: "{{ _env }}"
+    status_code: [200, 201, 409, 405]
+  register: _create_try
+  when: _existing_stack_id | string | length == 0
+
+- name: Decide fallback to method=string on create
+  set_fact:
+    _must_fallback_string: "{{ (_create_try.status | default(0)) == 405 }}"
+  when: _existing_stack_id | string | length == 0
+
+# Fallback: si el Portainer no permite repo directo (405), clonamos local y mandamos el docker-compose como string
+# OJO: esto requiere acceso al repo (tu caso usaba SSH; si no hay llave en el controlador, fallará).
+- name: Clone repo for {{ _name }} (fallback create via string)
+  delegate_to: localhost
+  become: false
+  git:
+    repo: "{{ _repo_url }}"
+    dest: "/tmp/ans_port_{{ _name }}"
+    version: "{{ _git_ref }}"
+    accept_hostkey: true
+  when:
+    - _existing_stack_id | string | length == 0
+    - _must_fallback_string
+
+- name: Read compose file content (fallback)
+  delegate_to: localhost
+  become: false
+  slurp:
+    src: "/tmp/ans_port_{{ _name }}/{{ _compose_path }}"
+  register: _compose_slurp
+  when:
+    - _existing_stack_id | string | length == 0
+    - _must_fallback_string
+
+- name: Create stack {{ _name }} via method=string
+  uri:
+    url: "{{ portainer_base_url }}/api/stacks?type=2&method=string&endpointId={{ _endpoint_resolved_id }}"
+    method: POST
+    validate_certs: false
+    headers: "{{ _portainer_auth_headers }}"
+    body_format: json
+    body:
+      Name: "{{ _name }}"
+      StackFileContent: "{{ (_compose_slurp.content | b64decode) }}"
+      ComposeFormat: 2
+      Env: "{{ _env }}"
+    status_code: [200, 201, 409]
+  register: _create_string
+  when:
+    - _existing_stack_id | string | length == 0
+    - _must_fallback_string
+
+# =========================
+# UPDATE (si ya existe)
+# =========================
+
+# Si existe, intentamos actualizar su referencia git y/o hacer redeploy
+- name: Update git ref / file path on existing stack {{ _name }} (best effort)
+  uri:
+    url: "{{ portainer_base_url }}/api/stacks/{{ _existing_stack_id }}"
+    method: PUT
+    validate_certs: false
+    headers: "{{ _portainer_auth_headers }}"
+    body_format: json
+    body:
+      # Solo aplica para stacks git-based; si no lo es, Portainer ignora/ falla benigno.
+      RepositoryReferenceName: "{{ _git_ref }}"
+      StackFilePath: "{{ _compose_path }}"
+    status_code: [200, 204, 400, 404]
+  register: _update_existing
+  when: _existing_stack_id | string | length > 0
+
+# Para stacks git-based modernos, el endpoint de redeploy suele ser (Portainer CE 2.19+):
+# POST /api/stacks/{id}/git/redeploy?endpointId={endpointId}
+- name: Git redeploy existing stack {{ _name }}
+  uri:
+    url: "{{ portainer_base_url }}/api/stacks/{{ _existing_stack_id }}/git/redeploy?endpointId={{ _endpoint_resolved_id }}"
+    method: POST
+    validate_certs: false
+    headers: "{{ _portainer_auth_headers }}"
+    status_code: [200, 204, 400, 404, 405]
+  register: _git_redeploy
+  when: _existing_stack_id | string | length > 0
+
+# Si el stack no es git-based (o Portainer responde 405), puedes decidir recrearlo:
+- name: Decide if we must recreate stack from repository
+  set_fact:
+    _must_recreate_from_repo: "{{ (_git_redeploy.status | default(0)) == 405 }}"
+  when: _existing_stack_id | string | length > 0
+
+# Borrado del stack no-git para recrear (ruta correcta de DELETE es /api/stacks/{id})
+- name: Delete non-git stack {{ _name }} to recreate from repository
+  uri:
+    url: "{{ portainer_base_url }}/api/stacks/{{ _existing_stack_id }}?endpointId={{ _endpoint_resolved_id }}"
+    method: DELETE
+    validate_certs: false
+    headers: "{{ _portainer_auth_headers }}"
+    status_code: [200, 204, 404]
+  register: _delete_existing
+  when:
+    - _existing_stack_id | string | length > 0
+    - _must_recreate_from_repo
+
+# Reintenta creación desde repo si se borró
+- name: Re-create stack {{ _name }} from repository (after delete)
+  uri:
+    url: "{{ portainer_base_url }}/api/stacks?type=2&method=repository&endpointId={{ _endpoint_resolved_id }}"
+    method: POST
+    validate_certs: false
+    headers: "{{ _portainer_auth_headers }}"
+    body_format: json
+    body:
+      Name: "{{ _name }}"
+      StackFilePath: "{{ _compose_path }}"
+      RepositoryURL: "{{ _repo_url }}"
+      RepositoryReferenceName: "{{ _git_ref }}"
+      ComposeFormat: 2
+      Env: "{{ _env }}"
+    status_code: [200, 201, 409, 405]
+  register: _recreate_try
+  when:
+    - _existing_stack_id | string | length > 0
+    - _must_recreate_from_repo
