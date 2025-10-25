@@ -76,10 +76,14 @@
 #######################################################################
 # 1) Autenticación y normalización de campos
 #######################################################################
-- name: Build Portainer auth headers
+# ⚠️ Separado en dos tareas para no usar variables recién definidas en el mismo set_fact
+- name: Definir modo de auth y token
   set_fact:
     _use_api_key: "{{ (portainer_use_api_key | default(true)) | bool }}"
     _token: "{{ portainer_api_token | default('') }}"
+
+- name: Build Portainer auth headers
+  set_fact:
     _headers: >-
       {{
         {'X-API-Key': _token}
