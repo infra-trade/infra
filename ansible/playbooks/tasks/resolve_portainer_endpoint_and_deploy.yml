@@ -1,8 +1,6 @@
 # playbooks/tasks/resolve_portainer_endpoint_and_deploy.yml
 ---
-# Este taskfile se incluye "per stack" con item que contiene:
-# name, endpoint, repo_url, compose_path, git_ref, env (opcional), endpoint_id (opcional)
-# Variables globales esperadas:
+# Variables esperadas globalmente:
 # - portainer_url_effective
 # - portainer_api_token
 # - portainer_validate_certs (bool, por defecto: false)
@@ -10,7 +8,7 @@
 # - alias_map (dict opcional para alias de endpoints)
 # - git_ssh_key_path (ruta a clave SSH del controlador; opcional pero requerida si repo usa git@)
 
-- name: Normalize fields for {{ item.name }}
+- name: Normalize fields
   vars:
     _env_default: []
   ansible.builtin.set_fact:
@@ -22,7 +20,7 @@
     _git_ref: "{{ item.git_ref | default('main') }}"
     _env: "{{ item.env | default(_env_default) }}"
 
-- name: Validate required fields for {{ _name }}
+- name: Validate required fields
   ansible.builtin.assert:
     that:
       - _name | string | length > 0
@@ -34,7 +32,7 @@
       name='{{ _name }}', repo_url='{{ _repo_url }}',
       compose_path='{{ _compose_path }}', git_ref='{{ _git_ref }}'.
 
-- name: Resolve endpointId for {{ _name }}
+- name: Resolve endpointId
   ansible.builtin.set_fact:
     _resolved_endpoint_id: |
       {%- if (_endpoint_id | default('') | string | length) > 0 -%}
@@ -47,7 +45,7 @@
       {{ (endpoints_by_name_map | default({})).get('local','') }}
       {%- endif -%}
 
-- name: Fail if endpoint cannot be resolved for {{ _name }}
+- name: Fail if endpoint cannot be resolved
   ansible.builtin.assert:
     that:
       - _resolved_endpoint_id | string | length > 0
@@ -83,7 +81,7 @@
 # -------------------------------------------------------
 # CREACIÓN: primero intentamos method=repository (POST)
 # -------------------------------------------------------
-- name: Try create stack {{ _name }} from repository
+- name: Try create stack from repository
   when: (_existing_stack_id | int) == 0
   ansible.builtin.uri:
     url: >-
@@ -115,7 +113,7 @@
       }}
 
 # -------------------------------------------------------------------
-# FALLBACK: method=string -> clonar repo en controlador y enviar file
+# FALLBACK: method=string -> clonar repo y enviar StackFileContent
 # -------------------------------------------------------------------
 - name: Fail early if SSH repo without key configured (create fallback)
   when:
@@ -128,7 +126,7 @@
       El repo {{ _repo_url }} usa SSH y no definiste git_ssh_key_path.
       Configura una clave SSH en el controlador y pon git_ssh_key_path con su ruta.
 
-- name: Clone repo for {{ _name }} (fallback create via string)
+- name: Clone repo (create fallback)
   when:
     - (_existing_stack_id | int) == 0
     - (_must_create_via_string | default(false))
@@ -141,7 +139,7 @@
   delegate_to: localhost
   run_once: true
 
-- name: Read compose file (create via string)
+- name: Read compose file (create fallback)
   when:
     - (_existing_stack_id | int) == 0
     - (_must_create_via_string | default(false))
@@ -151,7 +149,7 @@
   delegate_to: localhost
   run_once: true
 
-- name: Create stack {{ _name }} via method=string
+- name: Create stack via method=string
   when:
     - (_existing_stack_id | int) == 0
     - (_must_create_via_string | default(false))
@@ -175,8 +173,7 @@
 # -----------------------------------
 # ACTUALIZACIÓN DE STACK EXISTENTE
 # -----------------------------------
-# Intento 1: Si el stack es git-based, re-deploy
-- name: Determine if existing stack {{ _name }} is git-based
+- name: Determine if existing stack is git-based
   when: (_existing_stack_id | int) != 0
   ansible.builtin.set_fact:
     _existing_is_git: >-
@@ -187,7 +184,7 @@
         )
       }}
 
-- name: Update git ref / file path on existing stack {{ _name }} (best effort)
+- name: Update git ref / file path on existing stack (best effort)
   when:
     - (_existing_stack_id | int) != 0
     - (_existing_is_git | default(false))
@@ -199,7 +196,6 @@
       Content-Type: "application/json"
     body_format: json
     body:
-      # Estos campos pueden variar por versión de Portainer; se intenta best-effort:
       RepositoryURL: "{{ _repo_url }}"
       ComposeFilePathInRepository: "{{ _compose_path }}"
       RepositoryReferenceName: "{{ _git_ref }}"
@@ -208,7 +204,7 @@
   register: _update_git_cfg
   changed_when: "{{ _update_git_cfg.status in [200,204] | bool }}"
 
-- name: Git redeploy existing stack {{ _name }}
+- name: Git redeploy existing stack
   when:
     - (_existing_stack_id | int) != 0
     - (_existing_is_git | default(false))
@@ -222,8 +218,7 @@
   register: _redeploy_attempt
   changed_when: "{{ _redeploy_attempt.status in [200,204] | bool }}"
 
-# Intento 2: Si no es git-based o el redeploy no aplica, recreamos via string
-- name: Decide if we must recreate stack from repository (non-git or bad redeploy)
+- name: Decide if we must recreate via string (non-git or bad redeploy)
   when: (_existing_stack_id | int) != 0
   ansible.builtin.set_fact:
     _must_recreate_via_string: >-
@@ -243,7 +238,7 @@
       El repo {{ _repo_url }} usa SSH y no definiste git_ssh_key_path.
       Configura una clave SSH en el controlador y pon git_ssh_key_path con su ruta.
 
-- name: Clone repo for {{ _name }} (fallback recreate via string)
+- name: Clone repo (recreate fallback)
   when:
     - (_existing_stack_id | int) != 0
     - (_must_recreate_via_string | default(false))
@@ -256,7 +251,7 @@
   delegate_to: localhost
   run_once: true
 
-- name: Read compose file (recreate via string)
+- name: Read compose file (recreate fallback)
   when:
     - (_existing_stack_id | int) != 0
     - (_must_recreate_via_string | default(false))
@@ -266,7 +261,7 @@
   delegate_to: localhost
   run_once: true
 
-- name: Delete stack {{ _name }} (prior to recreate via string)
+- name: Delete stack (prior to recreate via string)
   when:
     - (_existing_stack_id | int) != 0
     - (_must_recreate_via_string | default(false))
@@ -280,7 +275,7 @@
   register: _delete_existing
   changed_when: "{{ _delete_existing.status in [200,204] | bool }}"
 
-- name: Recreate stack {{ _name }} via method=string
+- name: Recreate stack via method=string
   when:
     - (_existing_stack_id | int) != 0
     - (_must_recreate_via_string | default(false))
