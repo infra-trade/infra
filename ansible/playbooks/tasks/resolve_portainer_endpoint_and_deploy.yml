@@ -108,48 +108,82 @@
 # =========================
 # CREAR / ACTUALIZAR
 # =========================
-# RUTA HÍBRIDA COMPATIBLE:
-#   POST /api/stacks/create?type=2&method=repository&endpointId=...
-#   POST /api/stacks/create?type=2&method=string&endpointId=...
-- name: Define create URLs (hybrid compatible)
+# RUTAS:
+#   NUEVA:   POST /api/stacks/create?type=2&method=repository|string&endpointId=...
+#   LEGADA:  POST /api/stacks?type=2&method=repository|string&endpointId=...
+- name: Define create URLs (hybrid + legacy)
   set_fact:
-    _create_url_repo: >-
+    _create_url_repo_new: >-
       {{ portainer_base_url }}/api/stacks/create?type=2&method=repository&endpointId={{ _endpoint_resolved_id }}
-    _create_url_string: >-
+    _create_url_string_new: >-
       {{ portainer_base_url }}/api/stacks/create?type=2&method=string&endpointId={{ _endpoint_resolved_id }}
+    _create_url_repo_legacy: >-
+      {{ portainer_base_url }}/api/stacks?type=2&method=repository&endpointId={{ _endpoint_resolved_id }}
+    _create_url_string_legacy: >-
+      {{ portainer_base_url }}/api/stacks?type=2&method=string&endpointId={{ _endpoint_resolved_id }}
 
 - name: Debug create URLs to auditar
   debug:
     msg:
-      repo_url: "{{ _create_url_repo }}"
-      string_url: "{{ _create_url_string }}"
+      repo_new: "{{ _create_url_repo_new }}"
+      string_new: "{{ _create_url_string_new }}"
+      repo_legacy: "{{ _create_url_repo_legacy }}"
+      string_legacy: "{{ _create_url_string_legacy }}"
   when: _existing_stack_id | string | length == 0
 
-# Intento #1: crear desde REPO
-- name: Try create stack {{ _name }} from repository (hybrid path)
+# --------- CREAR DESDE REPO (INTENTO NUEVO -> LEGADO) ----------
+- name: Try create stack {{ _name }} from repository (NEW path)
   uri:
-    url: "{{ _create_url_repo }}"
+    url: "{{ _create_url_repo_new }}"
     method: POST
     validate_certs: false
     headers: "{{ _portainer_auth_headers }}"
     body_format: json
     body:
-      name: "{{ _name }}"
-      stackFilePath: "{{ _compose_path }}"
-      repositoryURL: "{{ _repo_url }}"
-      repositoryReferenceName: "{{ _git_ref }}"
-      composeFormat: 2
-      env: "{{ _env }}"
-    status_code: [200, 201, 409, 405, 400]
-  register: _create_try
+      Name: "{{ _name }}"
+      StackFilePath: "{{ _compose_path }}"
+      RepositoryURL: "{{ _repo_url }}"
+      RepositoryReferenceName: "{{ _git_ref }}"
+      ComposeFormat: 2
+      Env: "{{ _env }}"
+    status_code: [200, 201, 409, 405, 404]
+  register: _create_repo_new
   when: _existing_stack_id | string | length == 0
 
-- name: Decide fallback to method=string on create
+- name: Try create stack {{ _name }} from repository (LEGACY path if needed)
+  uri:
+    url: "{{ _create_url_repo_legacy }}"
+    method: POST
+    validate_certs: false
+    headers: "{{ _portainer_auth_headers }}"
+    body_format: json
+    body:
+      Name: "{{ _name }}"
+      StackFilePath: "{{ _compose_path }}"
+      RepositoryURL: "{{ _repo_url }}"
+      RepositoryReferenceName: "{{ _git_ref }}"
+      ComposeFormat: 2
+      Env: "{{ _env }}"
+    status_code: [200, 201, 409]
+  register: _create_repo_legacy
+  when:
+    - _existing_stack_id | string | length == 0
+    - (_create_repo_new.status | default(0)) in [405, 404]
+
+# --------- FALLBACK STRING (INTENTO NUEVO -> LEGADO) ----------
+- name: Need fallback to string?
   set_fact:
-    _must_fallback_string: "{{ (_create_try.status | default(0)) in [405, 400] }}"
-  when: _existing_stack_id | string | length == 0
+    _need_string_fallback: >-
+      {{
+        _existing_stack_id | string | length == 0 and
+        (
+          (_create_repo_new.status | default(0)) in [405, 404] and
+          (_create_repo_legacy.status | default(0)) in [405, 404]
+          or
+          (_create_repo_new is not defined and _create_repo_legacy is not defined)
+        )
+      }}
 
-# Fallback: crear desde STRING → necesitamos el compose
 - name: Create unique temp dir for {{ _name }} (fallback)
   tempfile:
     state: directory
@@ -157,9 +191,7 @@
   register: _tmpdir
   delegate_to: localhost
   become: false
-  when:
-    - _existing_stack_id | string | length == 0
-    - _must_fallback_string
+  when: _need_string_fallback
 
 - name: Clone repo for {{ _name }} (fallback create via string, idempotent)
   git:
@@ -170,9 +202,7 @@
     update: yes
   delegate_to: localhost
   become: false
-  when:
-    - _existing_stack_id | string | length == 0
-    - _must_fallback_string
+  when: _need_string_fallback
 
 - name: Read compose file content (fallback)
   slurp:
@@ -180,27 +210,41 @@
   register: _compose_slurp
   delegate_to: localhost
   become: false
-  when:
-    - _existing_stack_id | string | length == 0
-    - _must_fallback_string
+  when: _need_string_fallback
 
-- name: Create stack {{ _name }} via method=string (hybrid path)
+- name: Create stack {{ _name }} via method=string (NEW path)
   uri:
-    url: "{{ _create_url_string }}"
+    url: "{{ _create_url_string_new }}"
     method: POST
     validate_certs: false
     headers: "{{ _portainer_auth_headers }}"
     body_format: json
     body:
-      name: "{{ _name }}"
-      stackFileContent: "{{ (_compose_slurp.content | b64decode) }}"
-      composeFormat: 2
-      env: "{{ _env }}"
+      Name: "{{ _name }}"
+      StackFileContent: "{{ (_compose_slurp.content | b64decode) }}"
+      ComposeFormat: 2
+      Env: "{{ _env }}"
+    status_code: [200, 201, 409, 405, 404]
+  register: _create_string_new
+  when: _need_string_fallback
+
+- name: Create stack {{ _name }} via method=string (LEGACY path if needed)
+  uri:
+    url: "{{ _create_url_string_legacy }}"
+    method: POST
+    validate_certs: false
+    headers: "{{ _portainer_auth_headers }}"
+    body_format: json
+    body:
+      Name: "{{ _name }}"
+      StackFileContent: "{{ (_compose_slurp.content | b64decode) }}"
+      ComposeFormat: 2
+      Env: "{{ _env }}"
     status_code: [200, 201, 409]
-  register: _create_string
+  register: _create_string_legacy
   when:
-    - _existing_stack_id | string | length == 0
-    - _must_fallback_string
+    - _need_string_fallback
+    - (_create_string_new.status | default(0)) in [405, 404]
 
 - name: Cleanup temp dir (fallback)
   file:
@@ -209,12 +253,11 @@
   delegate_to: localhost
   become: false
   when:
-    - _existing_stack_id | string | length == 0
-    - _must_fallback_string
+    - _need_string_fallback
     - _tmpdir is defined
     - _tmpdir.path is defined
 
-# UPDATE si ya existe (best effort: ajustar ref y/o redeploy)
+# --------- UPDATE EXISTENTE ----------
 - name: Update git ref / file path on existing stack {{ _name }} (best effort)
   uri:
     url: "{{ portainer_base_url }}/api/stacks/{{ _existing_stack_id }}"
@@ -256,22 +299,41 @@
     - _existing_stack_id | string | length > 0
     - _must_recreate_from_repo
 
-- name: Re-create stack {{ _name }} from repository (hybrid path)
-  uri:
-    url: "{{ _create_url_repo }}"
-    method: POST
-    validate_certs: false
-    headers: "{{ _portainer_auth_headers }}"
-    body_format: json
-    body:
-      name: "{{ _name }}"
-      stackFilePath: "{{ _compose_path }}"
-      repositoryURL: "{{ _repo_url }}"
-      repositoryReferenceName: "{{ _git_ref }}"
-      composeFormat: 2
-      env: "{{ _env }}"
-    status_code: [200, 201, 409, 405, 400]
-  register: _recreate_try
+- name: Re-create stack {{ _name }} from repository (attempt NEW then LEGACY)
+  block:
+    - name: Re-create (NEW)
+      uri:
+        url: "{{ _create_url_repo_new }}"
+        method: POST
+        validate_certs: false
+        headers: "{{ _portainer_auth_headers }}"
+        body_format: json
+        body:
+          Name: "{{ _name }}"
+          StackFilePath: "{{ _compose_path }}"
+          RepositoryURL: "{{ _repo_url }}"
+          RepositoryReferenceName: "{{ _git_ref }}"
+          ComposeFormat: 2
+          Env: "{{ _env }}"
+        status_code: [200, 201, 409, 405, 404]
+      register: _recreate_repo_new
+
+    - name: Re-create (LEGACY if needed)
+      uri:
+        url: "{{ _create_url_repo_legacy }}"
+        method: POST
+        validate_certs: false
+        headers: "{{ _portainer_auth_headers }}"
+        body_format: json
+        body:
+          Name: "{{ _name }}"
+          StackFilePath: "{{ _compose_path }}"
+          RepositoryURL: "{{ _repo_url }}"
+          RepositoryReferenceName: "{{ _git_ref }}"
+          ComposeFormat: 2
+          Env: "{{ _env }}"
+        status_code: [200, 201, 409]
+      when: (_recreate_repo_new.status | default(0)) in [405, 404]
   when:
     - _existing_stack_id | string | length > 0
     - _must_recreate_from_repo
