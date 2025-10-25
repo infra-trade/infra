@@ -1,12 +1,11 @@
 ---
 # tasks file: playbooks/tasks/resolve_portainer_endpoint_and_deploy.yml
-# Requisitos previos (definidos en el play principal):
-# - p_url:               URL base de Portainer (p. ej. https://10.20.0.12:9443)
-# - p_api_token:         API Token efectivo
-# - p_validate_certs:    true/false
+
+# Variables de entrada esperadas (ya las define el play principal):
+# - p_url, p_api_token, p_validate_certs
 # - endpoints_by_name_map: dict { Name -> Id }
-# - alias_map:             dict de alias a nombre real (endpoint_aliases_effective)
-# - st:                  dict del stack (name, endpoint, repo_url, compose_path, git_ref, env, prune?, endpoint_id?)
+# - alias_map: dict de alias a nombre real
+# - st: dict del stack (name, endpoint, repo_url, compose_path|file_path, git_ref, env, prune?, type?, endpoint_id?)
 
 #######################################################################
 # 1) Normalizar campos del stack
@@ -21,6 +20,7 @@
     _file_path: "{{ st.file_path | default(st.compose_path) }}"
     _env_vars: "{{ st.env | default([]) }}"
     _prune: "{{ st.prune | default(true) }}"
+    _stack_type: "{{ st.type | default(2) }}"   # 2 = standalone/compose
 
 #######################################################################
 # 2) Validaciones mínimas
@@ -58,7 +58,7 @@
     success_msg: "All assertions passed"
 
 #######################################################################
-# 4) Obtener lista de stacks (para buscar si ya existe)
+# 4) Obtener lista de stacks (para saber si ya existe)
 #######################################################################
 - name: Fetch stacks list
   ansible.builtin.uri:
@@ -76,12 +76,62 @@
     _existing_stack_id: "{{ ((_stacks.json | selectattr('Name','equalto', _name) | list | first).Id | default(0)) | int }}"
 
 #######################################################################
-# 5) Crear stack desde repositorio (si no existe)
+# 5) Crear stack desde repositorio (si no existe) con fallback a string
 #######################################################################
-- name: Create stack {{ _name }} from repository (compose/standalone)
+- name: Try create stack {{ _name }} from repository
   when: (_existing_stack_id | int) == 0
   ansible.builtin.uri:
-    url: "{{ p_url }}/api/stacks?type={{ st.type | default(2) }}&method=repository&endpointId={{ _endpoint_id_resolved }}"
+    url: "{{ p_url }}/api/stacks?type={{ _stack_type }}&method=repository&endpointId={{ _endpoint_id_resolved }}"
+    method: POST
+    headers:
+      X-API-Key: "{{ p_api_token }}"
+      Content-Type: "application/json"
+    validate_certs: "{{ p_validate_certs }}"
+    # aceptamos también 405 para no fallar (lo gestionamos nosotros)
+    status_code: 200, 201, 405
+    body_format: json
+    body:
+      Name: "{{ _name }}"
+      RepositoryURL: "{{ _repo_url }}"
+      RepositoryReferenceName: "{{ _git_ref }}"
+      ComposeFilePathInRepository: "{{ _file_path }}"
+      Env: "{{ _env_vars }}"
+  register: _create_repo
+  failed_when: false
+
+- name: Decide fallback to method=string on create
+  when: (_existing_stack_id | int) == 0
+  ansible.builtin.set_fact:
+    _must_create_via_string: "{{ (_create_repo.status | default(0) | int) == 405 }}"
+
+# Fallback: clonar repo en el controlador y crear con method=string
+- name: Clone repo for {{ _name }} (fallback create via string)
+  when: (_existing_stack_id | int) == 0 and (_must_create_via_string | default(false))
+  ansible.builtin.git:
+    repo: "{{ _repo_url }}"
+    version: "{{ _git_ref }}"
+    dest: "/tmp/portainer_stack_{{ _name }}"
+    accept_hostkey: yes
+  delegate_to: localhost
+  run_once: true
+
+- name: Read compose file for {{ _name }} (fallback)
+  when: (_existing_stack_id | int) == 0 and (_must_create_via_string | default(false))
+  ansible.builtin.slurp:
+    src: "/tmp/portainer_stack_{{ _name }}/{{ _file_path }}"
+  register: _compose_slurp
+  delegate_to: localhost
+  run_once: true
+
+- name: Set compose content fact (fallback)
+  when: (_existing_stack_id | int) == 0 and (_must_create_via_string | default(false))
+  ansible.builtin.set_fact:
+    _compose_content: "{{ _compose_slurp.content | b64decode }}"
+
+- name: Create stack {{ _name }} via method=string (fallback)
+  when: (_existing_stack_id | int) == 0 and (_must_create_via_string | default(false))
+  ansible.builtin.uri:
+    url: "{{ p_url }}/api/stacks?type={{ _stack_type }}&method=string&endpointId={{ _endpoint_id_resolved }}"
     method: POST
     headers:
       X-API-Key: "{{ p_api_token }}"
@@ -91,11 +141,18 @@
     body_format: json
     body:
       Name: "{{ _name }}"
-      RepositoryURL: "{{ _repo_url }}"
-      RepositoryReferenceName: "{{ _git_ref }}"
-      ComposeFilePathInRepository: "{{ _file_path }}"
+      StackFileContent: "{{ _compose_content }}"
       Env: "{{ _env_vars }}"
-  register: _create
+  register: _create_string
+
+- name: Cleanup temp repo {{ _name }} (optional)
+  when: (_existing_stack_id | int) == 0 and (_must_create_via_string | default(false))
+  ansible.builtin.file:
+    path: "/tmp/portainer_stack_{{ _name }}"
+    state: absent
+  delegate_to: localhost
+  run_once: true
+  failed_when: false
 
 #######################################################################
 # 6) Si existe, determinar si es Git-based
@@ -124,16 +181,16 @@
       X-API-Key: "{{ p_api_token }}"
       Content-Type: "application/json"
     validate_certs: "{{ p_validate_certs }}"
-    status_code: 200
+    status_code: 200, 405
     body_format: json
     body:
       RepositoryReferenceName: "{{ _git_ref }}"
       ComposeFilePathInRepository: "{{ _file_path }}"
   register: _update
-  failed_when: false   # No queremos romper si Portainer no soporta este PUT tal cual
+  failed_when: false
 
 #######################################################################
-# 8) Redeploy Git si es git-based
+# 8) Redeploy Git si es git-based (si 405, decidimos recrear)
 #######################################################################
 - name: Git redeploy existing stack {{ _name }}
   when: (_existing_stack_id | int) > 0 and (_is_git_based | default(false))
@@ -144,17 +201,17 @@
       X-API-Key: "{{ p_api_token }}"
       Content-Type: "application/json"
     validate_certs: "{{ p_validate_certs }}"
-    status_code: 200, 204
+    status_code: 200, 204, 405
     body_format: json
     body:
       Prune: "{{ _prune }}"
       PullImage: true
       Env: "{{ _env_vars }}"
   register: _redeploy
-  failed_when: false   # Si devuelve 405, decidiremos recrear más abajo
+  failed_when: false
 
 #######################################################################
-# 9) Decidir si hay que recrear (solo si existía)
+# 9) Decidir si hay que recrear (si no es git-based o si redeploy devolvió 405)
 #######################################################################
 - name: Decide if we must recreate stack from repository
   when: (_existing_stack_id | int) > 0
@@ -167,9 +224,9 @@
       }}
 
 #######################################################################
-# 10) Si hay que recrear, borrar con ID correcto y endpointId
+# 10) Borrar stack existente con ID y endpoint correctos (si hay que recrear)
 #######################################################################
-- name: Delete non-git stack {{ _name }} to recreate from repository
+- name: Delete stack {{ _name }} to recreate from repository
   when: (_existing_stack_id | int) > 0 and (_must_recreate | default(false))
   ansible.builtin.uri:
     url: "{{ p_url }}/api/stacks/{{ _existing_stack_id }}?endpointId={{ _endpoint_id_resolved }}"
@@ -179,14 +236,63 @@
     validate_certs: "{{ p_validate_certs }}"
     status_code: 200, 204
   register: _deleted
+  failed_when: false
 
 #######################################################################
-# 11) Re-crear desde repositorio si se borró / había que recrear
+# 11) Re-crear desde repositorio (con el mismo fallback a string si 405)
 #######################################################################
-- name: Recreate stack {{ _name }} from repository (compose/standalone)
+- name: Try recreate stack {{ _name }} from repository
   when: (_must_recreate | default(false))
   ansible.builtin.uri:
-    url: "{{ p_url }}/api/stacks?type={{ st.type | default(2) }}&method=repository&endpointId={{ _endpoint_id_resolved }}"
+    url: "{{ p_url }}/api/stacks?type={{ _stack_type }}&method=repository&endpointId={{ _endpoint_id_resolved }}"
+    method: POST
+    headers:
+      X-API-Key: "{{ p_api_token }}"
+      Content-Type: "application/json"
+    validate_certs: "{{ p_validate_certs }}"
+    status_code: 200, 201, 405
+    body_format: json
+    body:
+      Name: "{{ _name }}"
+      RepositoryURL: "{{ _repo_url }}"
+      RepositoryReferenceName: "{{ _git_ref }}"
+      ComposeFilePathInRepository: "{{ _file_path }}"
+      Env: "{{ _env_vars }}"
+  register: _recreate_repo
+  failed_when: false
+
+- name: Decide fallback to method=string on recreate
+  when: (_must_recreate | default(false))
+  ansible.builtin.set_fact:
+    _must_recreate_via_string: "{{ (_recreate_repo.status | default(0) | int) == 405 }}"
+
+- name: Clone repo for {{ _name }} (fallback recreate via string)
+  when: (_must_recreate_via_string | default(false))
+  ansible.builtin.git:
+    repo: "{{ _repo_url }}"
+    version: "{{ _git_ref }}"
+    dest: "/tmp/portainer_stack_{{ _name }}"
+    accept_hostkey: yes
+  delegate_to: localhost
+  run_once: true
+
+- name: Read compose file for {{ _name }} (fallback recreate)
+  when: (_must_recreate_via_string | default(false))
+  ansible.builtin.slurp:
+    src: "/tmp/portainer_stack_{{ _name }}/{{ _file_path }}"
+  register: _compose_slurp_re
+  delegate_to: localhost
+  run_once: true
+
+- name: Set compose content fact (fallback recreate)
+  when: (_must_recreate_via_string | default(false))
+  ansible.builtin.set_fact:
+    _compose_content_re: "{{ _compose_slurp_re.content | b64decode }}"
+
+- name: Recreate stack {{ _name }} via method=string (fallback)
+  when: (_must_recreate_via_string | default(false))
+  ansible.builtin.uri:
+    url: "{{ p_url }}/api/stacks?type={{ _stack_type }}&method=string&endpointId={{ _endpoint_id_resolved }}"
     method: POST
     headers:
       X-API-Key: "{{ p_api_token }}"
@@ -196,14 +302,22 @@
     body_format: json
     body:
       Name: "{{ _name }}"
-      RepositoryURL: "{{ _repo_url }}"
-      RepositoryReferenceName: "{{ _git_ref }}"
-      ComposeFilePathInRepository: "{{ _file_path }}"
+      StackFileContent: "{{ _compose_content_re }}"
       Env: "{{ _env_vars }}"
-  register: _recreate
+  register: _recreate_string
+  failed_when: false
+
+- name: Cleanup temp repo {{ _name }} (optional, recreate)
+  when: (_must_recreate_via_string | default(false))
+  ansible.builtin.file:
+    path: "/tmp/portainer_stack_{{ _name }}"
+    state: absent
+  delegate_to: localhost
+  run_once: true
+  failed_when: false
 
 #######################################################################
-# 12) (Opcional) Auditoría rápida
+# 12) Auditoría rápida
 #######################################################################
 - name: Audit {{ _name }}
   ansible.builtin.debug:
@@ -214,7 +328,9 @@
       exists_id: "{{ _existing_stack_id }}"
       is_git_based: "{{ _is_git_based | default('n/a') }}"
       must_recreate: "{{ _must_recreate | default('n/a') }}"
-      updated: "{{ (_update.status | default('n/a')) if _update is defined else 'n/a' }}"
+      create_repo_status: "{{ (_create_repo.status | default('n/a')) if _create_repo is defined else 'n/a' }}"
+      create_string_status: "{{ (_create_string.status | default('n/a')) if _create_string is defined else 'n/a' }}"
+      update_status: "{{ (_update.status | default('n/a')) if _update is defined else 'n/a' }}"
       redeploy_status: "{{ (_redeploy.status | default('n/a')) if _redeploy is defined else 'n/a' }}"
-      created: "{{ (_create.status | default('n/a')) if _create is defined else 'n/a' }}"
-      recreated: "{{ (_recreate.status | default('n/a')) if _recreate is defined else 'n/a' }}"
+      recreate_repo_status: "{{ (_recreate_repo.status | default('n/a')) if _recreate_repo is defined else 'n/a' }}"
+      recreate_string_status: "{{ (_recreate_string.status | default('n/a')) if _recreate_string is defined else 'n/a' }}"
