@@ -1,24 +1,30 @@
 # playbooks/tasks/resolve_portainer_endpoint_and_deploy.yml
 ---
-# Variables esperadas globalmente:
-# - portainer_url_effective
-# - portainer_api_token
-# - portainer_validate_certs (bool, por defecto: false)
-# - endpoints_by_name_map (dict: {alias_or_name: endpointId})
-# - alias_map (dict opcional para alias de endpoints)
-# - git_ssh_key_path (ruta a clave SSH del controlador; opcional pero requerida si repo usa git@)
+# Este archivo no debe depender de 'item' directamente.
+# Acepta item/st/stack desde el include y lo normaliza en _it.
+
+- name: Resolve current stack object to _it
+  ansible.builtin.set_fact:
+    _it: "{{ (item is defined) | ternary(item, (st is defined) | ternary(st, stack | default({}))) }}"
+
+- name: Ensure _it is a valid stack object
+  ansible.builtin.assert:
+    that:
+      - _it is mapping
+      - (_it.name | default('')) | length > 0
+    fail_msg: "El include no pasó un objeto de stack válido (item/st/stack). Valor recibido: {{ _it }}"
 
 - name: Normalize fields
   vars:
     _env_default: []
   ansible.builtin.set_fact:
-    _name: "{{ item.name }}"
-    _endpoint: "{{ item.endpoint | default('') }}"
-    _endpoint_id: "{{ item.endpoint_id | default('') }}"
-    _repo_url: "{{ item.repo_url }}"
-    _compose_path: "{{ item.compose_path }}"
-    _git_ref: "{{ item.git_ref | default('main') }}"
-    _env: "{{ item.env | default(_env_default) }}"
+    _name: "{{ _it.name }}"
+    _endpoint: "{{ _it.endpoint | default('') }}"
+    _endpoint_id: "{{ _it.endpoint_id | default('') }}"
+    _repo_url: "{{ _it.repo_url }}"
+    _compose_path: "{{ _it.compose_path }}"
+    _git_ref: "{{ _it.git_ref | default('main') }}"
+    _env: "{{ _it.env | default(_env_default) }}"
 
 - name: Validate required fields
   ansible.builtin.assert:
