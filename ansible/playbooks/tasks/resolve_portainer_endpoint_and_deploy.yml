@@ -109,11 +109,11 @@
 # CREAR / ACTUALIZAR
 # =========================
 
-# --- URLs nuevas (Portainer 2.18+)
+# --- URLs nuevas (Portainer 2.18+) + type=2 requerido por tu build
 - name: Define create URLs (new endpoints)
   set_fact:
-    _create_url_repo: "{{ portainer_base_url }}/api/stacks/create/compose/repository?endpointId={{ _endpoint_resolved_id }}"
-    _create_url_string: "{{ portainer_base_url }}/api/stacks/create/compose/string?endpointId={{ _endpoint_resolved_id }}"
+    _create_url_repo: "{{ portainer_base_url }}/api/stacks/create/compose/repository?endpointId={{ _endpoint_resolved_id }}&type=2"
+    _create_url_string: "{{ portainer_base_url }}/api/stacks/create/compose/string?endpointId={{ _endpoint_resolved_id }}&type=2"
 
 - name: Debug create URLs to auditar
   debug:
@@ -122,7 +122,7 @@
       string_url: "{{ _create_url_string }}"
   when: _existing_stack_id | string | length == 0
 
-# Intento #1: crear desde REPO con endpoint NUEVO
+# Intento #1: crear desde REPO (nuevo path + type=2)
 - name: Try create stack {{ _name }} from repository (new API path)
   uri:
     url: "{{ _create_url_repo }}"
@@ -137,16 +137,16 @@
       repositoryReferenceName: "{{ _git_ref }}"
       composeFormat: 2
       env: "{{ _env }}"
-    status_code: [200, 201, 409, 405]
+    status_code: [200, 201, 409, 405, 400]
   register: _create_try
   when: _existing_stack_id | string | length == 0
 
 - name: Decide fallback to method=string on create
   set_fact:
-    _must_fallback_string: "{{ (_create_try.status | default(0)) == 405 }}"
+    _must_fallback_string: "{{ (_create_try.status | default(0)) in [405, 400] }}"
   when: _existing_stack_id | string | length == 0
 
-# Fallback: crear desde STRING (nuevo path) → necesitamos el contenido del compose
+# Fallback: crear desde STRING (nuevo path + type=2) → necesitamos el compose
 - name: Create unique temp dir for {{ _name }} (fallback)
   tempfile:
     state: directory
@@ -267,7 +267,7 @@
       repositoryReferenceName: "{{ _git_ref }}"
       composeFormat: 2
       env: "{{ _env }}"
-    status_code: [200, 201, 409, 405]
+    status_code: [200, 201, 409, 405, 400]
   register: _recreate_try
   when:
     - _existing_stack_id | string | length > 0
