@@ -1,19 +1,12 @@
 ---
-# Tarea incluída por:
-# - name: Resolve endpoint and deploy (per stack)
-#   include_tasks: tasks/resolve_portainer_endpoint_and_deploy.yml
-#   loop: "{{ stacks_effective | list if stacks_effective is sequence else (stacks_effective.keys() | list) }}"
-#   loop_control: { loop_var: item }
-
 #######################################################################
-# 0) Resolver el objeto de stack para este item (robusto y sin "unhashable")
+# 0) Resolver el objeto de stack para este item (robusto)
 #######################################################################
 - name: Normalizar colecciones de stacks (mapa y lista)
   set_fact:
     _stacks_map: "{{ (stacks_effective | default({})) if (stacks_effective is mapping) else {} }}"
     _stacks_seq: "{{ (stacks_effective | default([]))  if (stacks_effective is sequence) else [] }}"
 
-# Si item viene como dict, extraemos su nombre; si es string, lo usamos tal cual
 - name: Derivar _item_name y _item_obj
   set_fact:
     _item_obj: "{{ item if (item is mapping) else {} }}"
@@ -35,11 +28,6 @@
         if (_stacks_seq | length) > 0 and (_item_name | length) > 0 else []
       }}
 
-# Fuente de la verdad (_it):
-# 1) Si item ya es un dict con nombre, úsalo.
-# 2) Si existe en el mapa por clave _item_name, úsalo.
-# 3) Si aparece en la lista, toma el primero.
-# 4) Si nada de lo anterior, deja {} y la aserción siguiente lo explicará.
 - name: Resolve current stack object to _it
   set_fact:
     _it: >-
@@ -68,15 +56,10 @@
     success_msg: "All assertions passed"
     fail_msg: >
       No encontré definición para el item '{{ _item_name }}' en 'stacks_effective'.
-      Define un objeto con 'name' en stacks_effective (mapa o lista).
-      Pistas:
-      - keys del mapa: {{ _stacks_map.keys() | default([]) }}
-      - nombres en la lista: {{ (_stacks_seq | map(attribute='name') | list) | default([]) }}
 
 #######################################################################
 # 1) Autenticación y normalización de campos
 #######################################################################
-# ⚠️ Separado en dos tareas para no usar variables recién definidas en el mismo set_fact
 - name: Definir modo de auth y token
   set_fact:
     _use_api_key: "{{ (portainer_use_api_key | default(true)) | bool }}"
@@ -93,8 +76,7 @@
 
 - name: Validate token presence
   assert:
-    that:
-      - _token | length > 0
+    that: [ "_token | length > 0" ]
     success_msg: "All assertions passed"
     fail_msg: "portainer_api_token ausente/vacío."
 
@@ -108,9 +90,9 @@
     _env: "{{ _it.env | default([]) }}"
 
 #######################################################################
-# 2) Resolver endpointId a partir de mapas/listas disponibles
+# 2) Resolver endpointId con alias dinámicos
 #######################################################################
-# Preferir mapa interno si existe; si no, construirlo desde endpoints_list.
+# Mapa nombre->Id (si no existe, construir desde endpoints_list)
 - name: Construir mapa de endpoints por nombre si no existe
   set_fact:
     _endpoints_by_name_map: >-
@@ -118,33 +100,47 @@
         endpoints_by_name_map
           if (endpoints_by_name_map is mapping)
         else
-          (
-            _endpoints_by_name_map
-              if (_endpoints_by_name_map is mapping)
-            else
-              (
-                dict( (endpoints_list | default([])) | map(attribute='Name') | zip((endpoints_list | default([])) | map(attribute='Id')) )
-              )
-          )
+          dict( (endpoints_list | default([])) | map(attribute='Name') | zip((endpoints_list | default([])) | map(attribute='Id')) )
       }}
 
+# Construir alias dinámico:
+#  - base := Name sin sufijo "-core" (si no lo tiene, queda igual)
+#  - alias base->Name (ej: airflow -> airflow-core)
+#  - alias fijo mon->local
+#  - combinar con alias_map del usuario si existe
+- name: Construir alias dinámicos para endpoints
+  set_fact:
+    _core_alias_map: >-
+      {{
+        dict(
+          (
+            (endpoints_list | default([])) | map(attribute='Name') | list
+          )
+          | map('regex_replace', '-core$', '')
+          | list
+          | zip( (endpoints_list | default([])) | map(attribute='Name') | list )
+        )
+      }}
+    _alias_map: >-
+      {{
+        {'mon': 'local'}
+        | combine(_core_alias_map)
+        | combine(alias_map | default({}))
+      }}
+
+# Resolver alias final y endpointId
 - name: Resolver endpointId
   set_fact:
+    _endpoint_resolved_name: >-
+      {{
+        (_alias_map.get(_endpoint) if (_endpoint | length > 0) else 'local')
+      }}
     _endpoint_id: >-
       {{
-        (
-          (_it.endpoint_id | default('')) | string
-          if (_it.endpoint_id | default('') | string | length > 0)
-          else
-            (
-              _endpoints_by_name_map.get(_endpoint)
-                if (_endpoint | length > 0)
-              else
-                (
-                  _endpoints_by_name_map.get('local') | default('')
-                )
-            )
-        )
+        _endpoints_by_name_map.get(_endpoint_resolved_name)
+        | default(_endpoints_by_name_map.get(_endpoint))
+        | default(_endpoints_by_name_map.get('local'))
+        | default('')
       }}
 
 - name: Fail if endpoint cannot be resolved
@@ -152,10 +148,10 @@
     that:
       - _endpoint_id | string | length > 0
     success_msg: "All assertions passed"
-    fail_msg: "No pude resolver endpointId para '{{ _name }}' (endpoint='{{ _endpoint }}')."
+    fail_msg: "No pude resolver endpointId para '{{ _name }}' (endpoint='{{ _endpoint }}'). Alias usado='{{ _endpoint_resolved_name }}'. Endpoints conocidos={{ _endpoints_by_name_map.keys() | list }}"
 
 #######################################################################
-# 3) Leer stacks existentes y buscar colisión exacta por nombre
+# 3) Leer stacks existentes
 #######################################################################
 - name: Fetch stacks list
   uri:
@@ -166,12 +162,6 @@
     return_content: true
     status_code: 200
   register: _stacks_resp
-
-# Si el servidor devolviera 401 con JWT mal formateado, se puede usar esta task extra para fallar explícito.
-- name: Fail if unauthorized (bad/expired token or wrong header type)
-  when: _stacks_resp.status == 401
-  fail:
-    msg: "Portainer devolvió 401 Unauthorized. Verifica: - Si usas API Key, define portainer_use_api_key: true - Si usas JWT, que no esté expirado (re-genera). Detalle: {{ _stacks_resp.json | default(_stacks_resp.content) }}"
 
 - name: Find existing stack id by name (exact match)
   set_fact:
@@ -190,8 +180,7 @@
       }}
 
 #######################################################################
-# 4) Crear stack (preferir método repository; fallback a string)
-#    Soporta endpoints "nuevos" (/create/compose/...) y fallback "legacy".
+# 4) Crear stack (repo primero; fallback string) — soporta NEW y LEGACY
 #######################################################################
 - name: Definir URLs de creación (hybrid + legacy)
   set_fact:
@@ -222,7 +211,7 @@
       pullImage: true
   register: _create_repo_new
 
-- name: Try create stack {{ _name }} from repository (LEGACY path if 405/404/400)
+- name: Try create stack {{ _name }} from repository (LEGACY path si 405/404/400)
   when:
     - (_existing_id | string) == ''
     - _repo_url | length > 0
@@ -246,9 +235,7 @@
   register: _create_repo_legacy
 
 #######################################################################
-# 5) Fallback a creación por STRING si:
-#    - no hay repo_url, o
-#    - la creación por repo falló y no existe stack aún.
+# 5) Fallback a creación por STRING si aplica
 #######################################################################
 - name: Decidir si debemos intentar creación por string
   set_fact:
@@ -277,7 +264,7 @@
   register: _tmpdir
   delegate_to: localhost
 
-- name: Clonar repo (si hay) o preparar ruta (fallback create via string, idempotente)
+- name: Clonar repo (si hay) (fallback create via string)
   when: _must_string and (_repo_url | length) > 0
   git:
     repo: "{{ _repo_url }}"
@@ -332,11 +319,14 @@
   register: _create_string_legacy
 
 #######################################################################
-# 6) Resultado (solo auditoría)
+# 6) Auditoría final
 #######################################################################
 - name: Resultado de creación/auditoría para {{ _name }}
   debug:
     msg:
+      endpoint_requested: "{{ _endpoint }}"
+      endpoint_alias_used: "{{ _endpoint_resolved_name }}"
+      endpoint_id: "{{ _endpoint_id }}"
       existing_id: "{{ _existing_id | default('') }}"
       repo_new_status: "{{ _create_repo_new.status if _create_repo_new is defined else 'n/a' }}"
       repo_legacy_status: "{{ _create_repo_legacy.status if _create_repo_legacy is defined else 'n/a' }}"
