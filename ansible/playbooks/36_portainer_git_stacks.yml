@@ -5,96 +5,71 @@
   gather_facts: false
 
   vars:
-    # ==== AJUSTA AQUÍ SEGÚN TU ENTORNO ====
-    portainer_base_url: "https://10.20.0.12:9443"
+    # === Configuración esperada ===
+    # Puedes definir esto en group_vars/all.yml o -e
+    # portainer_url: "https://10.20.0.12:9443"
+    # portainer_api_key: "ptr_xxx"             # si usas API Key
+    # portainer_api_token: "eyJhbGciOi..."      # si usas JWT
+    # portainer_use_api_key: true               # true->X-API-Key; false->Bearer
+    # stacks:                                   # lista de stacks
+    #   - { name: "mon",     endpoint: "mon",     repo_url: "git@github.com:infra-trade/infra.git", compose_path: "mon/compose/docker-compose.yml",     git_ref: "main", env: [] }
+    #   - { name: "airflow", endpoint: "airflow", repo_url: "git@github.com:infra-trade/infra.git", compose_path: "airflow/compose/docker-compose.yml", git_ref: "main", env: [] }
+    #   - { name: "kafka",   endpoint: "kafka",   repo_url: "git@github.com:infra-trade/infra.git", compose_path: "kafka/compose/docker-compose.yml",   git_ref: "main", env: [] }
+    #   - { name: "spark",   endpoint: "spark",   repo_url: "git@github.com:infra-trade/infra.git", compose_path: "spark/compose/docker-compose.yml",   git_ref: "main", env: [] }
+    #   - { name: "db",      endpoint: "db",      repo_url: "git@github.com:infra-trade/infra.git", compose_path: "db/compose/docker-compose.yml",      git_ref: "main", env: [] }
 
-    # Usa API Key (recomendado):
-    portainer_use_api_key: true
-    portainer_api_token: "{{ lookup('env', 'PORTAINER_TOKEN') | default('', true) }}"
+    # Permitir alias opcionales definidos por el usuario
+    alias_map: {}
 
-    # Mapeo alias -> nombre real de endpoint
-    portainer_endpoint_aliases:
-      mon: "local"
-      airflow: "airflow-core"
-      kafka: "kafka-core"
-      spark: "spark-core"
-      db: "db-core"
-
-    # Stacks a gestionar
-    stacks:
-      - name: mon
-        endpoint: mon
-        repo_url: "git@github.com:infra-trade/infra.git"
-        compose_path: "mon/compose/docker-compose.yml"
-        git_ref: "main"
-        env: []
-      - name: airflow
-        endpoint: airflow
-        repo_url: "git@github.com:infra-trade/infra.git"
-        compose_path: "airflow/compose/docker-compose.yml"
-        git_ref: "main"
-        env: []
-      - name: kafka
-        endpoint: kafka
-        repo_url: "git@github.com:infra-trade/infra.git"
-        compose_path: "kafka/compose/docker-compose.yml"
-        git_ref: "main"
-        env: []
-      - name: spark
-        endpoint: spark
-        repo_url: "git@github.com:infra-trade/infra.git"
-        compose_path: "spark/compose/docker-compose.yml"
-        git_ref: "main"
-        env: []
-      - name: db
-        endpoint: db
-        repo_url: "git@github.com:infra-trade/infra.git"
-        compose_path: "db/compose/docker-compose.yml"
-        git_ref: "main"
-        env: []
-
-  tasks:
-    - name: Build effective Portainer URL (avoid self-recursion)
-      set_fact:
-        portainer_base_url: "{{ portainer_base_url | regex_replace('/+$', '') }}"
-
+  pre_tasks:
     - name: Fail early if token missing
+        # No fallamos aquí si el usuario prefiere API Key o JWT;
+        # el include hará la validación final con fallback local.
       assert:
         that:
-          - portainer_api_token | string | length > 0
-        fail_msg: "portainer_api_token vacío. Define un API Key (recomendado) o JWT."
+          - (portainer_api_key is defined) or (portainer_api_token is defined)
+        fail_msg: "Debes definir 'portainer_api_key' (API Key) o 'portainer_api_token' (JWT)."
+      run_once: true
 
-    - name: Check Portainer is reachable
+    - name: Check Portainer is reachable (ping GET /api/status)
       uri:
-        url: "{{ portainer_base_url }}/api/system/status"
+        url: "{{ (portainer_url | default('')) | ternary(portainer_url, 'http://127.0.0.1') }}/api/status"
         method: GET
         validate_certs: false
-        return_content: false
+        return_content: true
         status_code: 200
-      register: _portainer_ping
+      register: _status
+      run_once: true
 
+    # Obtener endpoints para construir mapas por nombre/Id
     - name: Fetch endpoints
       uri:
-        url: "{{ portainer_base_url }}/api/endpoints"
+        url: "{{ (portainer_url | default('')) | ternary(portainer_url, 'http://127.0.0.1') }}/api/endpoints"
         method: GET
         validate_certs: false
+        return_content: true
+        status_code: 200
         headers: >-
           {{
-            ({'X-API-Key': portainer_api_token})
-            if (portainer_use_api_key | default(false) | bool)
-            else ({'Authorization': 'Bearer ' ~ portainer_api_token})
+            (portainer_use_api_key | default(true))
+              | ternary({'X-API-Key': portainer_api_key | default('')},
+                        {'Authorization': 'Bearer ' ~ (portainer_api_token | default(''))})
           }}
-        status_code: 200
-      register: _endpoints
+      register: endpoints_resp
+      run_once: true
 
-    - name: Build endpoints list
+    - name: Build endpoints maps/lists (use internal var names to avoid collisions)
       set_fact:
-        _endpoints_list: "{{ _endpoints.json | default([]) }}"
-
-    - name: Build endpoints_by_name_map (Name -> Id) sin plugins extra
-      set_fact:
-        _endpoints_by_name_map: "{{ _endpoints_by_name_map | default({}) | combine({item.Name: item.Id}) }}"
-      loop: "{{ _endpoints_list }}"
+        endpoints_list: "{{ (endpoints_resp.json | default([])) | list }}"
+        endpoints_by_name_map: >-
+          {{
+            dict( (endpoints_resp.json | default([]))
+                  | map('extract', {'Name':'Name','Id':'Id'})
+                  | map('list')
+                  | map('reverse')         # [Id, Name] -> [Name, Id]
+                  | map('list') )
+          }}
+      run_once: true
 
     - name: Load stacks (from group_vars or -e) into stacks_effective
       set_fact:
@@ -103,20 +78,18 @@
     - name: Assert stacks are provided
       assert:
         that:
-          - stacks_effective | length > 0
-        fail_msg: "No se recibieron stacks (var 'stacks' vacía)."
+          - stacks_effective is sequence
+          - (stacks_effective | length) > 0
+        fail_msg: "No se definieron stacks (variable 'stacks')."
 
     - name: Show detected endpoints (audit)
       debug:
-        var: _endpoints_list
+        var: endpoints_list
+      run_once: true
 
+  tasks:
     - name: Resolve endpoint and deploy (per stack)
       include_tasks: "tasks/resolve_portainer_endpoint_and_deploy.yml"
       loop: "{{ stacks_effective }}"
       loop_control:
         loop_var: item
-        label: "{{ item.name }}"
-      vars:
-        endpoints_by_name_map: "{{ _endpoints_by_name_map }}"
-        alias_map: "{{ portainer_endpoint_aliases }}"
-        portainer_use_api_key_effective: "{{ portainer_use_api_key | default(false) | bool }}"

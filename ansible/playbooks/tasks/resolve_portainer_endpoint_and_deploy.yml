@@ -1,49 +1,47 @@
 ---
-#######################################################################
-# 0) Resolver el objeto de stack para este item (robusto)
-#######################################################################
+# Este task-file recibe "item" que puede ser:
+# - un dict de stack {name, endpoint, repo_url, compose_path, git_ref, env}
+# - (opcional) un string (nombre) si prefieres mapear por nombre en 'stacks' como dict
+
+############################################################
+# 1) Normalización básica del item
+############################################################
 - name: Normalizar colecciones de stacks (mapa y lista)
   set_fact:
-    _stacks_map: "{{ (stacks_effective | default({})) if (stacks_effective is mapping) else {} }}"
-    _stacks_seq: "{{ (stacks_effective | default([]))  if (stacks_effective is sequence) else [] }}"
+    _stacks_map: "{{ stacks_effective if (stacks_effective is mapping) else {} }}"
+    _stacks_seq: "{{ stacks_effective if (stacks_effective is sequence) else [] }}"
 
 - name: Derivar _item_name y _item_obj
   set_fact:
-    _item_obj: "{{ item if (item is mapping) else {} }}"
     _item_name: >-
       {{
-        (item.name | default(item.Name) | default(''))
-        if (item is mapping)
-        else (item | string)
+        (item.name if (item is mapping and ('name' in item)) else
+         (item if (item is string) else ''))
+      }}
+    _item_obj: >-
+      {{
+        (item if (item is mapping) else {})
       }}
 
 - name: Resolver coincidencia por nombre en la lista (si aplica)
   set_fact:
-    _seq_match: >-
-      {{
-        (_stacks_seq
-          | selectattr('name','defined')
-          | selectattr('name','equalto', _item_name)
-          | list)
-        if (_stacks_seq | length) > 0 and (_item_name | length) > 0 else []
-      }}
+    _seq_match: "{{ _stacks_seq | selectattr('name','equalto', _item_name) | list }}"
+  when: _item_obj | length == 0 and _item_name | length > 0
 
 - name: Resolve current stack object to _it
   set_fact:
     _it: >-
       {{
         _item_obj
-          if (_item_obj is mapping and (_item_obj.name | default('')) | length > 0)
+          if (_item_obj | length > 0)
         else
           (
-            _stacks_map[_item_name]
-              if (_stacks_map is mapping and (_item_name | length > 0) and (_item_name in _stacks_map.keys()))
+            (_stacks_map[_item_name])
+              if (_stacks_map is mapping and (_item_name in _stacks_map))
             else
               (
-                _seq_match[0]
-                  if (_seq_match | length) > 0
-                else
-                  {}
+                (_seq_match[0]) if ((_seq_match | default([])) | length > 0)
+                else {}
               )
           )
       }}
@@ -52,110 +50,129 @@
   assert:
     that:
       - _it is mapping
-      - (_it.name | default('')) | length > 0
-    success_msg: "All assertions passed"
-    fail_msg: >
-      No encontré definición para el item '{{ _item_name }}' en 'stacks_effective'.
+      - "'name' in _it"
+      - "'endpoint' in _it"
+      - "'repo_url' in _it"
+      - "'compose_path' in _it"
+      - "'git_ref' in _it"
+      - "'env' in _it"
+    fail_msg: "El item de stack no es válido o le faltan campos requeridos."
 
-#######################################################################
-# 1) Autenticación y normalización de campos
-#######################################################################
+############################################################
+# 2) Auth + URL base (con fallback LOCAL)
+############################################################
 - name: Definir modo de auth y token
   set_fact:
-    _use_api_key: "{{ (portainer_use_api_key | default(true)) | bool }}"
-    _token: "{{ portainer_api_token | default('') }}"
+    _use_api_key: "{{ portainer_use_api_key | default(true) }}"
+    _token: >-
+      {{
+        (portainer_api_key | default('')) if (_use_api_key)
+        else (portainer_api_token | default(''))
+      }}
 
 - name: Build Portainer auth headers
   set_fact:
     _headers: >-
       {{
-        {'X-API-Key': _token}
-        if _use_api_key
-        else {'Authorization': 'Bearer ' + _token}
+        _use_api_key
+          | ternary({'X-API-Key': _token}, {'Authorization': 'Bearer ' ~ _token})
       }}
 
 - name: Validate token presence
   assert:
-    that: [ "_token | length > 0" ]
-    success_msg: "All assertions passed"
-    fail_msg: "portainer_api_token ausente/vacío."
+    that:
+      - _token | length > 0
+    fail_msg: "No hay token de Portainer. Define 'portainer_api_key' (API Key) o 'portainer_api_token' (JWT)."
 
+# <<< AJUSTE CLAVE: URL efectiva por host >>>
+- name: Asegurar URL base de Portainer para este host
+  set_fact:
+    _portainer_url_effective: >-
+      {{
+        portainer_url_effective
+          | default(portainer_url | default(''))
+      }}
+
+- name: Fallar si no hay URL de Portainer
+  assert:
+    that:
+      - _portainer_url_effective | length > 0
+    fail_msg: >-
+      'portainer_url_effective' no está definido en este host y no hay
+      'portainer_url' de respaldo. Define uno de ellos (por ejemplo en group_vars/all)."
+
+############################################################
+# 3) Normalizar campos del stack
+############################################################
 - name: Normalize fields
   set_fact:
-    _name: "{{ _it.name }}"
-    _endpoint: "{{ _it.endpoint | default('') }}"
-    _repo_url: "{{ _it.repo_url | default('') }}"
-    _compose_path: "{{ _it.compose_path | default('docker-compose.yml') }}"
-    _git_ref: "{{ _it.git_ref | default('main') }}"
-    _env: "{{ _it.env | default([]) }}"
+    _name:          "{{ _it.name | string }}"
+    _endpoint:      "{{ _it.endpoint | string }}"
+    _repo_url:      "{{ _it.repo_url | string }}"
+    _compose_path:  "{{ _it.compose_path | string }}"
+    _git_ref:       "{{ _it.git_ref | default('main') | string }}"
+    _env:           "{{ _it.env | default([]) }}"
 
-#######################################################################
-# 2) Resolver endpointId con alias dinámicos
-#######################################################################
+############################################################
+# 4) Resolver endpointId (alias dinámicos)
+############################################################
 - name: Construir mapa de endpoints por nombre si no existe
   set_fact:
-    _endpoints_by_name_map: >-
+    _endpoints_by_name: >-
       {{
-        endpoints_by_name_map
-          if (endpoints_by_name_map is mapping)
-        else
-          dict( (endpoints_list | default([])) | map(attribute='Name') | zip((endpoints_list | default([])) | map(attribute='Id')) )
+        (endpoints_by_name_map
+          if (endpoints_by_name_map is mapping) else
+          dict( endpoints_list | map(attribute='Name') |
+                zip(endpoints_list | map(attribute='Id')) )
       }}
 
 - name: Construir alias base -core (base -> nombre real)
   set_fact:
-    _core_alias_map: >-
+    _base_alias: >-
       {{
-        dict(
-          (
-            (endpoints_list | default([])) | map(attribute='Name') | list
-          )
-          | map('regex_replace', '-core$', '')
-          | list
-          | zip( (endpoints_list | default([])) | map(attribute='Name') | list )
-        )
+        dict( (_endpoints_by_name.keys() | list)
+              | select('search','-core$')
+              | map('regex_replace','-core$','')
+              | list
+              |
+              zip(_endpoints_by_name.keys() | list
+                  | select('search','-core$') | list)
+            )
       }}
 
 - name: Fusionar alias dinámicos y del usuario
   set_fact:
-    _alias_map: >-
-      {{
-        {'mon': 'local'}
-        | combine(_core_alias_map | default({}))
-        | combine(alias_map | default({}))
-      }}
+    _alias_all: "{{ _base_alias | combine(alias_map | default({}), recursive=True) }}"
 
-# >>> FIX: calcular alias y luego usarlo en otro task (evita var undefined)
 - name: Resolver nombre efectivo de endpoint (tras alias)
   set_fact:
     _endpoint_resolved_name: >-
       {{
-        (_alias_map.get(_endpoint) if (_endpoint | length > 0) else 'local')
+        _alias_all.get(_endpoint, _endpoint)
       }}
 
 - name: Resolver endpointId
   set_fact:
     _endpoint_id: >-
       {{
-        _endpoints_by_name_map.get(_endpoint_resolved_name)
-        | default(_endpoints_by_name_map.get(_endpoint))
-        | default(_endpoints_by_name_map.get('local'))
-        | default('')
+        (
+          _endpoints_by_name.get(_endpoint_resolved_name)
+            if (_endpoints_by_name is mapping) else ''
+        ) | string
       }}
 
 - name: Fail if endpoint cannot be resolved
   assert:
     that:
-      - _endpoint_id | string | length > 0
-    success_msg: "All assertions passed"
-    fail_msg: "No pude resolver endpointId para '{{ _name }}' (endpoint='{{ _endpoint }}'). Alias usado='{{ _endpoint_resolved_name }}'. Endpoints conocidos={{ _endpoints_by_name_map.keys() | list }}"
+      - _endpoint_id | length > 0
+    fail_msg: "No pude resolver endpointId para '{{ _name }}' (endpoint='{{ _endpoint }}')."
 
-#######################################################################
-# 3) Leer stacks existentes
-#######################################################################
+############################################################
+# 5) Consultar stacks actuales y localizar si existe
+############################################################
 - name: Fetch stacks list
   uri:
-    url: "{{ portainer_url_effective }}/api/stacks"
+    url: "{{ _portainer_url_effective }}/api/stacks"
     method: GET
     headers: "{{ _headers }}"
     validate_certs: false
@@ -163,60 +180,60 @@
     status_code: 200
   register: _stacks_resp
 
+- name: Fail if unauthorized (bad/expired token or wrong header type)
+  assert:
+    that:
+      - _stacks_resp.status == 200
+      - (_stacks_resp.json is not mapping) or (_stacks_resp.json.message | default('') != 'Invalid JWT token')
+    fail_msg: >-
+      Portainer devolvió 401 Unauthorized. Verifica:
+      - Si usas API Key, define portainer_use_api_key: true
+      - Si usas JWT, que no esté expirado (re-genera).
+      Detalle: {{ _stacks_resp.json | default({}) }}
+
 - name: Find existing stack id by name (exact match)
   set_fact:
-    _existing_stack: >-
+    _existing_id: >-
       {{
         (_stacks_resp.json | default([]))
           | selectattr('Name','equalto', _name)
-          | selectattr('EndpointId','equalto', (_endpoint_id | int))
+          | map(attribute='Id')
           | list
-      }}
-    _existing_id: >-
-      {{
-        (_existing_stack[0].Id | default(''))
-        if (_existing_stack | length) > 0
-        else ''
+          | first | default('')
       }}
 
-#######################################################################
-# 4) Crear stack (repo primero; fallback string) — soporta NEW y LEGACY
-#######################################################################
-- name: Definir URLs de creación (hybrid + legacy)
+############################################################
+# 6) Intentar crear (primero NEW endpoint; luego LEGACY). Si existe, saltar.
+############################################################
+- name: Definir create URLs (hybrid + legacy)
   set_fact:
     _create_urls:
-      repo_new:   "{{ portainer_url_effective }}/api/stacks/create/compose/repository?endpointId={{ _endpoint_id }}"
-      string_new: "{{ portainer_url_effective }}/api/stacks/create/compose/string?endpointId={{ _endpoint_id }}"
-      repo_legacy:   "{{ portainer_url_effective }}/api/stacks?type=2&method=repository&endpointId={{ _endpoint_id }}"
-      string_legacy: "{{ portainer_url_effective }}/api/stacks?type=2&method=string&endpointId={{ _endpoint_id }}"
+      repo_new:     "{{ _portainer_url_effective }}/api/stacks/create/compose/repository?endpointId={{ _endpoint_id }}"
+      string_new:   "{{ _portainer_url_effective }}/api/stacks/create/compose/string?endpointId={{ _endpoint_id }}"
+      repo_legacy:  "{{ _portainer_url_effective }}/api/stacks?type=2&method=repository&endpointId={{ _endpoint_id }}"
+      string_legacy:"{{ _portainer_url_effective }}/api/stacks?type=2&method=string&endpointId={{ _endpoint_id }}"
 
 - name: Try create stack {{ _name }} from repository (NEW path)
-  when:
-    - (_existing_id | string) == ''
-    - _repo_url | length > 0
   uri:
     url: "{{ _create_urls.repo_new }}"
     method: POST
     headers: "{{ _headers }}"
     validate_certs: false
-    status_code: [200, 201, 409, 400, 405, 404]
+    status_code: [200, 201, 409]   # 409 == already exists
     body_format: json
     body:
-      name: "{{ _name }}"
-      repositoryURL: "{{ _repo_url }}"
-      composeFilePathInRepository: "{{ _compose_path }}"
-      repositoryReferenceName: "{{ _git_ref }}"
-      env: "{{ _env }}"
-      prune: true
-      pullImage: true
-  register: _create_repo_new
+      Name: "{{ _name }}"
+      ComposeFilePathInRepository: "{{ _compose_path }}"
+      RepositoryURL: "{{ _repo_url }}"
+      RepositoryReferenceName: "{{ _git_ref }}"
+      PullImage: true
+      Prune: true
+      Env: "{{ _env }}"
+  register: _create_new
+  when: _existing_id | length == 0
+  failed_when: false
 
-- name: Try create stack {{ _name }} from repository (LEGACY path si 405/404/400)
-  when:
-    - (_existing_id | string) == ''
-    - _repo_url | length > 0
-    - _create_repo_new is defined
-    - _create_repo_new.status in [405, 404, 400]
+- name: Try create stack {{ _name }} from repository (LEGACY path if needed)
   uri:
     url: "{{ _create_urls.repo_legacy }}"
     method: POST
@@ -225,85 +242,78 @@
     status_code: [200, 201, 409]
     body_format: json
     body:
-      name: "{{ _name }}"
-      repositoryURL: "{{ _repo_url }}"
-      composeFilePathInRepository: "{{ _compose_path }}"
-      repositoryReferenceName: "{{ _git_ref }}"
-      env: "{{ _env }}"
-      prune: true
-      pullImage: true
-  register: _create_repo_legacy
+      Name: "{{ _name }}"
+      ComposeFilePathInRepository: "{{ _compose_path }}"
+      RepositoryURL: "{{ _repo_url }}"
+      RepositoryReferenceName: "{{ _git_ref }}"
+      PullImage: true
+      Prune: true
+      Env: "{{ _env }}"
+  when:
+    - _existing_id | length == 0
+    - _create_new is defined
+    - _create_new.status is defined
+    - _create_new.status in [400, 404, 405]
+  register: _create_legacy
+  failed_when: false
 
-#######################################################################
-# 5) Fallback a creación por STRING si aplica
-#######################################################################
-- name: Decidir si debemos intentar creación por string
+############################################################
+# 7) Si sigue sin existir, fallback método string (clonado local)
+############################################################
+- name: Decidir fallback a method=string en create
   set_fact:
-    _must_string: >-
+    _need_string_fallback: >-
       {{
+        (_existing_id | length == 0) and
         (
-          (_existing_id | string) == '' and
-          (
-            _repo_url | length == 0 or
-            (
-              _create_repo_new is defined and _create_repo_new.status not in [200,201,409]
-            ) or
-            (
-              _create_repo_new is not defined and
-              _create_repo_legacy is defined and _create_repo_legacy.status not in [200,201,409]
-            )
-          )
+          (_create_new is defined and _create_new.status in [400,404,405]) and
+          (_create_legacy is defined and _create_legacy.status in [400,404,405])
         )
       }}
 
-- name: Crear dir temporal único para {{ _name }} (fallback)
-  when: _must_string
+- name: Create unique temp dir for {{ _name }} (fallback)
   tempfile:
     state: directory
-    prefix: "ans_port_{{ _name }}_"
+    suffix: "_ans_port_{{ _name }}"
   register: _tmpdir
   delegate_to: localhost
+  when: _need_string_fallback
 
-- name: Clonar repo (si hay) (fallback create via string)
-  when: _must_string and (_repo_url | length) > 0
+- name: Clone repo for {{ _name }} (fallback create via string, idempotent)
   git:
     repo: "{{ _repo_url }}"
-    dest: "{{ _tmpdir.path }}/repo"
+    dest: "{{ _tmpdir.path }}"
     version: "{{ _git_ref }}"
     accept_hostkey: yes
   delegate_to: localhost
+  when: _need_string_fallback
 
-- name: Leer contenido del compose (fallback)
-  when: _must_string
+- name: Read compose file content (fallback)
   slurp:
-    src: >-
-      {{
-        (_tmpdir.path + '/repo/' + _compose_path)
-          if (_repo_url | length) > 0
-        else
-          (_compose_path)
-      }}
+    src: "{{ _tmpdir.path }}/{{ _compose_path }}"
   register: _compose_slurp
   delegate_to: localhost
+  when: _need_string_fallback
 
-- name: Crear stack {{ _name }} via method=string (NEW path)
-  when: _must_string
+- name: Create stack {{ _name }} via method=string (NEW path)
   uri:
     url: "{{ _create_urls.string_new }}"
     method: POST
     headers: "{{ _headers }}"
     validate_certs: false
-    status_code: [200, 201, 409, 400, 405, 404]
+    status_code: [200, 201, 409]
     body_format: json
     body:
-      name: "{{ _name }}"
-      stackFileContent: "{{ (_compose_slurp.content | b64decode) }}"
-      env: "{{ _env }}"
-      prune: true
+      Name: "{{ _name }}"
+      StackFileContent: "{{ _compose_slurp.content | b64decode }}"
+      Env: "{{ _env }}"
+      Prune: true
+      PullImage: true
   register: _create_string_new
+  when: _need_string_fallback
+  failed_when: false
 
-- name: Crear stack {{ _name }} via method=string (LEGACY path si 405/404/400)
-  when: _must_string and _create_string_new is defined and _create_string_new.status in [405, 404, 400]
+- name: Create stack {{ _name }} via method=string (LEGACY path)
   uri:
     url: "{{ _create_urls.string_legacy }}"
     method: POST
@@ -312,23 +322,14 @@
     status_code: [200, 201, 409]
     body_format: json
     body:
-      name: "{{ _name }}"
-      stackFileContent: "{{ (_compose_slurp.content | b64decode) }}"
-      env: "{{ _env }}"
-      prune: true
+      Name: "{{ _name }}"
+      StackFileContent: "{{ _compose_slurp.content | b64decode }}"
+      Env: "{{ _env }}"
+      Prune: true
+      PullImage: true
+  when:
+    - _need_string_fallback
+    - _create_string_new is defined
+    - _create_string_new.status in [400,404,405]
   register: _create_string_legacy
-
-#######################################################################
-# 6) Auditoría final
-#######################################################################
-- name: Resultado de creación/auditoría para {{ _name }}
-  debug:
-    msg:
-      endpoint_requested: "{{ _endpoint }}"
-      endpoint_alias_used: "{{ _endpoint_resolved_name }}"
-      endpoint_id: "{{ _endpoint_id }}"
-      existing_id: "{{ _existing_id | default('') }}"
-      repo_new_status: "{{ _create_repo_new.status if _create_repo_new is defined else 'n/a' }}"
-      repo_legacy_status: "{{ _create_repo_legacy.status if _create_repo_legacy is defined else 'n/a' }}"
-      string_new_status: "{{ _create_string_new.status if _create_string_new is defined else 'n/a' }}"
-      string_legacy_status: "{{ _create_string_legacy.status if _create_string_legacy is defined else 'n/a' }}"
+  failed_when: false
