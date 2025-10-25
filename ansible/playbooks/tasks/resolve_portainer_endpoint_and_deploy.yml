@@ -92,7 +92,6 @@
 #######################################################################
 # 2) Resolver endpointId con alias dinámicos
 #######################################################################
-# Mapa nombre->Id (si no existe, construir desde endpoints_list)
 - name: Construir mapa de endpoints por nombre si no existe
   set_fact:
     _endpoints_by_name_map: >-
@@ -103,12 +102,8 @@
           dict( (endpoints_list | default([])) | map(attribute='Name') | zip((endpoints_list | default([])) | map(attribute='Id')) )
       }}
 
-# Construir alias dinámico:
-#  - base := Name sin sufijo "-core" (si no lo tiene, queda igual)
-#  - alias base->Name (ej: airflow -> airflow-core)
-#  - alias fijo mon->local
-#  - combinar con alias_map del usuario si existe
-- name: Construir alias dinámicos para endpoints
+# >>> FIX: separar en 2 tasks para que _core_alias_map exista antes de usarlo <<<
+- name: Construir alias base -core (base -> nombre real)
   set_fact:
     _core_alias_map: >-
       {{
@@ -121,14 +116,16 @@
           | zip( (endpoints_list | default([])) | map(attribute='Name') | list )
         )
       }}
+
+- name: Fusionar alias dinámicos y del usuario
+  set_fact:
     _alias_map: >-
       {{
         {'mon': 'local'}
-        | combine(_core_alias_map)
+        | combine(_core_alias_map | default({}))
         | combine(alias_map | default({}))
       }}
 
-# Resolver alias final y endpointId
 - name: Resolver endpointId
   set_fact:
     _endpoint_resolved_name: >-
