@@ -102,7 +102,6 @@
           dict( (endpoints_list | default([])) | map(attribute='Name') | zip((endpoints_list | default([])) | map(attribute='Id')) )
       }}
 
-# >>> FIX: separar en 2 tasks para que _core_alias_map exista antes de usarlo <<<
 - name: Construir alias base -core (base -> nombre real)
   set_fact:
     _core_alias_map: >-
@@ -126,12 +125,16 @@
         | combine(alias_map | default({}))
       }}
 
-- name: Resolver endpointId
+# >>> FIX: calcular alias y luego usarlo en otro task (evita var undefined)
+- name: Resolver nombre efectivo de endpoint (tras alias)
   set_fact:
     _endpoint_resolved_name: >-
       {{
         (_alias_map.get(_endpoint) if (_endpoint | length > 0) else 'local')
       }}
+
+- name: Resolver endpointId
+  set_fact:
     _endpoint_id: >-
       {{
         _endpoints_by_name_map.get(_endpoint_resolved_name)
@@ -152,7 +155,7 @@
 #######################################################################
 - name: Fetch stacks list
   uri:
-    url: "{{ portainer_url_effective | mandatory }}/api/stacks"
+    url: "{{ portainer_url_effective }}/api/stacks"
     method: GET
     headers: "{{ _headers }}"
     validate_certs: false
