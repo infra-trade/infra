@@ -1,8 +1,6 @@
 # playbooks/tasks/resolve_portainer_endpoint_and_deploy.yml
 ---
-# Este archivo no debe depender de 'item' directamente.
-# Acepta item/st/stack desde el include y lo normaliza en _it.
-
+# Normaliza el objeto del stack (acepta item/st/stack)
 - name: Resolve current stack object to _it
   ansible.builtin.set_fact:
     _it: "{{ (item is defined) | ternary(item, (st is defined) | ternary(st, stack | default({}))) }}"
@@ -14,6 +12,25 @@
       - (_it.name | default('')) | length > 0
     fail_msg: "El include no pasó un objeto de stack válido (item/st/stack). Valor recibido: {{ _it }}"
 
+# Construye cabeceras de autenticación (API Key o JWT)
+- name: Build Portainer auth headers
+  ansible.builtin.set_fact:
+    portainer_auth_headers: >-
+      {{
+        (portainer_use_api_key | default(false)) | ternary(
+          {'X-API-Key': portainer_api_token},
+          {'Authorization': 'Bearer ' ~ portainer_api_token}
+        )
+      }}
+
+# Validación básica del token
+- name: Validate token presence
+  ansible.builtin.assert:
+    that:
+      - (portainer_api_token | default('')) | length > 0
+    fail_msg: "portainer_api_token vacío. Define la API Key o el JWT."
+
+# Normaliza campos del stack
 - name: Normalize fields
   vars:
     _env_default: []
@@ -38,6 +55,7 @@
       name='{{ _name }}', repo_url='{{ _repo_url }}',
       compose_path='{{ _compose_path }}', git_ref='{{ _git_ref }}'.
 
+# Resolver endpointId usando los mapas construidos en el play principal
 - name: Resolve endpointId
   ansible.builtin.set_fact:
     _resolved_endpoint_id: |
@@ -66,12 +84,21 @@
   ansible.builtin.uri:
     url: "{{ portainer_url_effective }}/api/stacks"
     method: GET
-    headers:
-      Authorization: "Bearer {{ portainer_api_token }}"
+    headers: "{{ portainer_auth_headers }}"
     validate_certs: "{{ portainer_validate_certs | default(false) }}"
     return_content: true
+    status_code: [200,401]
   register: _stacks_list
   changed_when: false
+
+- name: Fail if unauthorized (bad/expired token or wrong header type)
+  when: _stacks_list.status == 401
+  ansible.builtin.fail:
+    msg: >-
+      Portainer devolvió 401 Unauthorized. Verifica:
+      - Si usas API Key, define portainer_use_api_key: true
+      - Si usas JWT, que no esté expirado (re-genera).
+      Detalle: {{ _stacks_list.json | default(_stacks_list.content | default('')) }}
 
 - name: Find existing stack id by name (exact match)
   ansible.builtin.set_fact:
@@ -93,9 +120,7 @@
     url: >-
       {{ portainer_url_effective }}/api/stacks?type=2&method=repository&endpointId={{ _resolved_endpoint_id }}
     method: POST
-    headers:
-      Authorization: "Bearer {{ portainer_api_token }}"
-      Content-Type: "application/json"
+    headers: "{{ portainer_auth_headers | combine({'Content-Type':'application/json'}) }}"
     body_format: json
     body:
       name: "{{ _name }}"
@@ -163,9 +188,7 @@
     url: >-
       {{ portainer_url_effective }}/api/stacks?type=2&method=string&endpointId={{ _resolved_endpoint_id }}
     method: POST
-    headers:
-      Authorization: "Bearer {{ portainer_api_token }}"
-      Content-Type: "application/json"
+    headers: "{{ portainer_auth_headers | combine({'Content-Type':'application/json'}) }}"
     body_format: json
     body:
       Name: "{{ _name }}"
@@ -197,9 +220,7 @@
   ansible.builtin.uri:
     url: "{{ portainer_url_effective }}/api/stacks/{{ _existing_stack_id }}"
     method: PUT
-    headers:
-      Authorization: "Bearer {{ portainer_api_token }}"
-      Content-Type: "application/json"
+    headers: "{{ portainer_auth_headers | combine({'Content-Type':'application/json'}) }}"
     body_format: json
     body:
       RepositoryURL: "{{ _repo_url }}"
@@ -217,8 +238,7 @@
   ansible.builtin.uri:
     url: "{{ portainer_url_effective }}/api/stacks/{{ _existing_stack_id }}/git/redeploy?endpointId={{ _resolved_endpoint_id }}"
     method: POST
-    headers:
-      Authorization: "Bearer {{ portainer_api_token }}"
+    headers: "{{ portainer_auth_headers }}"
     validate_certs: "{{ portainer_validate_certs | default(false) }}"
     status_code: [200, 204, 400, 404, 405]
   register: _redeploy_attempt
@@ -274,8 +294,7 @@
   ansible.builtin.uri:
     url: "{{ portainer_url_effective }}/api/stacks/{{ _existing_stack_id }}?endpointId={{ _resolved_endpoint_id }}"
     method: DELETE
-    headers:
-      Authorization: "Bearer {{ portainer_api_token }}"
+    headers: "{{ portainer_auth_headers }}"
     validate_certs: "{{ portainer_validate_certs | default(false) }}"
     status_code: [200,204,404]
   register: _delete_existing
@@ -289,9 +308,7 @@
     url: >-
       {{ portainer_url_effective }}/api/stacks?type=2&method=string&endpointId={{ _resolved_endpoint_id }}
     method: POST
-    headers:
-      Authorization: "Bearer {{ portainer_api_token }}"
-      Content-Type: "application/json"
+    headers: "{{ portainer_auth_headers | combine({'Content-Type':'application/json'}) }}"
     body_format: json
     body:
       Name: "{{ _name }}"
